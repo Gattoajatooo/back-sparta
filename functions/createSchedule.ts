@@ -1,0 +1,879 @@
+import { createClientFromRequest } from 'npm:@base44/sdk@0.7.1';
+
+// Helper para preencher variáveis na mensagem
+function fillVariables(content, contact, user, company) {
+    if (!content) return '';
+    let message = content;
+    if (contact) {
+        const firstName = contact.first_name || contact.name?.split(' ')[0] || '';
+        const lastName = contact.last_name || contact.name?.split(' ').slice(1).join(' ') || '';
+        const fullName = (contact.first_name && contact.last_name) 
+            ? `${contact.first_name} ${contact.last_name}`.trim() 
+            : contact.name || firstName;
+        
+        message = message.replace(/{{\s*first_name\s*}}/gi, firstName);
+        message = message.replace(/{{\s*last_name\s*}}/gi, lastName);
+        message = message.replace(/{{\s*full_name\s*}}/gi, fullName);
+        message = message.replace(/{{\s*name\s*}}/gi, fullName);
+        message = message.replace(/{{\s*email\s*}}/gi, contact.email || '');
+        message = message.replace(/{{\s*phone\s*}}/gi, contact.phone || '');
+        message = message.replace(/{{\s*company_name\s*}}/gi, contact.company_name || '');
+    }
+    if (user) {
+        message = message.replace(/{{\s*user.full_name\s*}}/gi, user.full_name || '');
+        message = message.replace(/{{\s*user.first_name\s*}}/gi, user.full_name?.split(' ')[0] || '');
+        message = message.replace(/{{\s*user.email\s*}}/gi, user.email || '');
+    }
+    if (company) {
+        message = message.replace(/{{\s*company.name\s*}}/gi, company.name || '');
+    }
+    return message;
+}
+
+// Função para converter horário local de São Paulo para UTC
+function convertToUTC(dateStr, timeStr) {
+    const datePart = new Date(dateStr).toISOString().split('T')[0];
+    const timePart = timeStr || '09:00';
+    const localDateTime = `${datePart}T${timePart}:00`;
+    const localDate = new Date(localDateTime);
+    
+    // Adicionar 3 horas para converter de São Paulo (UTC-3) para UTC
+    return new Date(localDate.getTime() + (3 * 60 * 60 * 1000));
+}
+
+// Helper para enviar lotes para o Cloudflare
+async function sendBatchToCloudflare(base44, batchSchedule, scheduleData, user, company) {
+    console.log(`\n🚀 ========== INICIANDO PROCESSAMENTO DO LOTE ${batchSchedule.id} ==========`);
+    const serviceRoleBase44 = base44.asServiceRole;
+
+    try {
+        // PASSO 1: Buscar dados necessários
+        console.log('\n📋 [PASSO 1/4] Buscando dados necessários...');
+        
+        const parentSchedule = await serviceRoleBase44.entities.Schedule.get(batchSchedule.schedule_id);
+        let finalRecipients = parentSchedule.recipients || [];
+
+        if (finalRecipients.length === 0) {
+            throw new Error('Nenhum destinatário encontrado.');
+        }
+        console.log(`   ✓ ${finalRecipients.length} destinatários encontrados`);
+
+        const templates = [];
+        if (batchSchedule.template_ids?.length > 0) {
+            const templatePromises = batchSchedule.template_ids.map(id => 
+                serviceRoleBase44.entities.MessageTemplate.get(id).catch(() => null)
+            );
+            const results = await Promise.all(templatePromises);
+            templates.push(...results.filter(Boolean));
+        }
+        if (templates.length === 0) {
+            throw new Error('Nenhum template válido encontrado.');
+        }
+        console.log(`   ✓ ${templates.length} template(s) carregado(s)`);
+
+        const contactIds = finalRecipients.map(r => r.contact_id).filter(Boolean);
+        const fullContacts = {};
+        if (contactIds.length > 0) {
+            const contactPromises = contactIds.map(id => 
+                serviceRoleBase44.entities.Contact.get(id).catch(() => null)
+            );
+            const results = await Promise.all(contactPromises);
+            results.filter(Boolean).forEach(contact => fullContacts[contact.id] = contact);
+        }
+        console.log(`   ✓ ${Object.keys(fullContacts).length} contato(s) carregado(s)`);
+        
+        // NOVO: PASSO 1.5 - BUSCAR DETALHES DAS SESSÕES
+        console.log('\n📱 [PASSO 1.5/4] Buscando detalhes das sessões...');
+        const sessionDetails = {};
+        const selectedSessionNames = batchSchedule.selected_sessions || [];
+
+        // Buscar TODAS as sessões da empresa de uma vez
+        const allSessions = await serviceRoleBase44.entities.Session.filter({
+            company_id: user.company_id,
+            is_deleted: { '$ne': true }
+        });
+        
+        // Mapear sessões por session_name
+        for (const session of allSessions) {
+            if (selectedSessionNames.includes(session.session_name)) {
+                sessionDetails[session.session_name] = {
+                    phone: session.phone || null,
+                    push_name: session.push_name || null
+                };
+            }
+        }
+        
+        // Log para verificação
+        console.log(`   ✓ ${selectedSessionNames.length} sessão(ões) selecionada(s):`);
+        for (const sessionName of selectedSessionNames) {
+            const phone = sessionDetails[sessionName]?.phone || 'SEM TELEFONE';
+            console.log(`      • ${sessionName} → ${phone}`);
+        }
+        
+        // PASSO 2: Preparar payloads para o Cloudflare
+        console.log('\n📦 [PASSO 2/4] Preparando payloads para o Cloudflare...');
+        
+        const allSchedulerPayloads = [];
+        let currentTime = batchSchedule.run_at;
+        
+        let minIntervalMs = batchSchedule.delivery_settings?.interval_random_min || 20000;
+        let maxIntervalMs = batchSchedule.delivery_settings?.interval_random_max || 60000;
+
+        const messageType = parentSchedule.type === 'immediate' ? 'immediately' : 'scheduled';
+
+        // NOVO: Processar template_order se existir (para smart templates)
+        const templateOrder = batchSchedule.template_order || parentSchedule.template_order || [];
+        const useTemplateOrder = templateOrder.length > 0;
+
+        for (const [index, recipient] of finalRecipients.entries()) {
+            const contactData = fullContacts[recipient.contact_id] || recipient;
+            
+            // Selecionar template baseado em template_order ou fallback para templates array
+            let template, variationIndex = null;
+            
+            if (useTemplateOrder) {
+                const orderItem = templateOrder[index % templateOrder.length];
+                const baseTemplate = templates.find(t => t.id === orderItem.template_id);
+                
+                if (!baseTemplate) {
+                    console.warn(`   ⚠️ Template ${orderItem.template_id} não encontrado. Pulando...`);
+                    continue;
+                }
+                
+                // Verificar se é variação ou original
+                if (orderItem.variation_index !== null && orderItem.variation_index !== undefined) {
+                    variationIndex = orderItem.variation_index;
+                    const variations = baseTemplate.content_variations || [];
+                    
+                    if (variations[variationIndex]) {
+                        // Criar template temporário com a variação
+                        template = {
+                            ...baseTemplate,
+                            content: variations[variationIndex]
+                        };
+                        console.log(`   📝 Usando variação ${variationIndex} do template ${baseTemplate.name}`);
+                    } else {
+                        console.warn(`   ⚠️ Variação ${variationIndex} não existe. Usando original.`);
+                        template = baseTemplate;
+                    }
+                } else {
+                    // Usar conteúdo original
+                    template = baseTemplate;
+                    console.log(`   📝 Usando conteúdo original do template ${baseTemplate.name}`);
+                }
+            } else {
+                template = templates[index % templates.length];
+            }
+
+            const templateContentType = template.content_type || 'text';
+
+            if (index > 0) {
+                const interval = Math.floor(Math.random() * (maxIntervalMs - minIntervalMs + 1)) + minIntervalMs;
+                currentTime += interval;
+            }
+
+            const sessionName = batchSchedule.selected_sessions[index % batchSchedule.selected_sessions.length];
+            const sessionPhone = sessionDetails[sessionName]?.phone || null;
+            
+            const formattedPhone = String(contactData.phone).replace(/\D/g, '');
+            const chatId = `${formattedPhone}@c.us`;
+
+            const basePayload = {
+                batch_id: batchSchedule.id,
+                company_id: user.company_id,
+                contact_id: recipient.contact_id,
+                user_id: user.id,
+                schedule_id: batchSchedule.schedule_id,
+                session_name: sessionName,
+                session_number: sessionPhone,
+                chat_id: chatId,
+                direction: 'sent',
+                type: messageType,
+                run_at: currentTime,
+                created_at: Date.now(),
+                updated_at: Date.now(),
+                metadata: { 
+                    campaign_name: scheduleData.name, 
+                    template_id: template.id,
+                    template_name: template.name,
+                    variation_index: variationIndex,
+                    schedule_id: batchSchedule.schedule_id,
+                    contact_name: contactData.first_name && contactData.last_name 
+                        ? `${contactData.first_name} ${contactData.last_name}`.trim()
+                        : contactData.first_name || contactData.name || 'Sem nome',
+                    phone_number: formattedPhone
+                }
+            };
+
+            let messagePayload;
+            
+            if (templateContentType === 'text') {
+                const finalContent = fillVariables(template.content, contactData, user, company);
+                messagePayload = {
+                    ...basePayload,
+                    content: finalContent,
+                    message_type: 'text'
+                };
+            } else {
+                const attachment = template.attachments?.[0];
+                
+                if (!attachment || !attachment.url) {
+                    console.warn(`   ⚠️ Template ${template.id} sem anexo válido. Pulando...`);
+                    continue;
+                }
+
+                const caption = template.content ? fillVariables(template.content, contactData, user, company) : '';
+                let workerMessageType = templateContentType;
+                if (templateContentType === 'audio') {
+                    workerMessageType = 'voice';
+                }
+
+                messagePayload = {
+                    ...basePayload,
+                    content: caption,
+                    message_type: workerMessageType,
+                    caption: caption,
+                    filename: attachment.filename,
+                    mimetype: attachment.mimetype || attachment.type,
+                    file_url: attachment.url,
+                    metadata: {
+                        ...basePayload.metadata,
+                        attachment: {
+                            url: attachment.url,
+                            filename: attachment.filename,
+                            mimetype: attachment.mimetype || attachment.type,
+                            type: templateContentType
+                        }
+                    }
+                };
+            }
+
+            allSchedulerPayloads.push(messagePayload);
+        }
+        
+        console.log(`   ✓ ${allSchedulerPayloads.length} payload(s) preparado(s)`);
+        
+        // PASSO 3: Enviar para o Cloudflare e coletar scheduler_job_ids
+        console.log('\n☁️  [PASSO 3/4] Enviando para o Cloudflare Scheduler...');
+        
+        const BATCH_SIZE_CLOUDFLARE = 100;
+        const messagesToCreate = []; // Mensagens com scheduler_job_id para criar no Base44
+        
+        const scheduleUrl = Deno.env.get("SCHEDULE_URL");
+        const jobsApiKey = Deno.env.get("JOBS_API_KEY");
+
+        for (let i = 0; i < allSchedulerPayloads.length; i += BATCH_SIZE_CLOUDFLARE) {
+            const chunk = allSchedulerPayloads.slice(i, i + BATCH_SIZE_CLOUDFLARE);
+            const chunkNumber = Math.floor(i / BATCH_SIZE_CLOUDFLARE) + 1;
+            const totalChunks = Math.ceil(allSchedulerPayloads.length / BATCH_SIZE_CLOUDFLARE);
+            
+            console.log(`   📤 Enviando chunk ${chunkNumber}/${totalChunks} (${chunk.length} mensagens)...`);
+            
+            try {
+                const schedulerResponse = await fetch(`${scheduleUrl}/jobs/batch`, {
+                    method: 'POST',
+                    headers: { 
+                        'Content-Type': 'application/json', 
+                        'Authorization': `Bearer ${jobsApiKey}` 
+                    },
+                    body: JSON.stringify(chunk)
+                });
+
+                if (!schedulerResponse.ok) {
+                    const errorText = await schedulerResponse.text();
+                    throw new Error(`Erro do scheduler (${schedulerResponse.status}): ${errorText}`);
+                }
+                
+                const schedulerResult = await schedulerResponse.json();
+
+                if (schedulerResult.success && Array.isArray(schedulerResult.data)) {
+                    let successCount = 0;
+                    let failCount = 0;
+                    
+                    schedulerResult.data.forEach((jobResult, index) => {
+                        const originalPayload = chunk[index];
+                        
+                        if (jobResult.ok && jobResult.job?.id) {
+                            // Sucesso: adicionar com scheduler_job_id
+                            messagesToCreate.push({
+                                ...originalPayload,
+                                scheduler_job_id: jobResult.job.id,
+                                status: 'pending'
+                            });
+                            successCount++;
+                        } else {
+                            // Falha: adicionar como failed
+                            messagesToCreate.push({
+                                ...originalPayload,
+                                scheduler_job_id: null,
+                                status: 'failed',
+                                error_details: `Falha no Cloudflare: ${jobResult.error || 'Erro desconhecido'}`
+                            });
+                            failCount++;
+                        }
+                    });
+                    
+                    console.log(`   ✓ Chunk ${chunkNumber}: ${successCount} agendados, ${failCount} falharam`);
+                } else {
+                    throw new Error(`Resposta inválida do scheduler: ${JSON.stringify(schedulerResult)}`);
+                }
+            } catch (error) {
+                console.error(`   ❌ Erro no chunk ${chunkNumber}:`, error.message);
+                
+                // Marcar todas as mensagens deste chunk como failed
+                chunk.forEach(payload => {
+                    messagesToCreate.push({
+                        ...payload,
+                        scheduler_job_id: null,
+                        status: 'failed',
+                        error_details: `Erro ao enviar para Cloudflare: ${error.message}`
+                    });
+                });
+            }
+            
+            // Pequeno delay entre chunks
+            if (i + BATCH_SIZE_CLOUDFLARE < allSchedulerPayloads.length) {
+                await new Promise(resolve => setTimeout(resolve, 300));
+            }
+        }
+
+        const totalScheduled = messagesToCreate.filter(m => m.status === 'pending').length;
+        const totalFailed = messagesToCreate.filter(m => m.status === 'failed').length;
+        
+        console.log(`\n   📊 Resumo do Cloudflare:`);
+        console.log(`      ✅ Agendadas: ${totalScheduled}`);
+        console.log(`      ❌ Falharam: ${totalFailed}`);
+        console.log(`      📦 Total: ${messagesToCreate.length}`);
+        
+        // PASSO 4: Criar mensagens no Base44 com scheduler_job_ids
+        console.log('\n💾 [PASSO 4/4] Criando mensagens no Base44...');
+        
+        const BATCH_SIZE_BASE44 = 200;
+        let totalCreated = 0;
+
+        for (let i = 0; i < messagesToCreate.length; i += BATCH_SIZE_BASE44) {
+            const chunkBase44 = messagesToCreate.slice(i, i + BATCH_SIZE_BASE44);
+            const chunkNumber = Math.floor(i / BATCH_SIZE_BASE44) + 1;
+            const totalChunks = Math.ceil(messagesToCreate.length / BATCH_SIZE_BASE44);
+            
+            console.log(`   💾 Salvando chunk ${chunkNumber}/${totalChunks} (${chunkBase44.length} mensagens)...`);
+            
+            try {
+                await serviceRoleBase44.entities.Message.bulkCreate(chunkBase44);
+                totalCreated += chunkBase44.length;
+                console.log(`   ✓ Chunk ${chunkNumber} salvo com sucesso`);
+            } catch (error) {
+                console.error(`   ❌ Erro ao salvar chunk ${chunkNumber}:`, error.message);
+            }
+            
+            // Pequeno delay entre chunks
+            if (i + BATCH_SIZE_BASE44 < messagesToCreate.length) {
+                await new Promise(resolve => setTimeout(resolve, 300));
+            }
+        }
+        
+        console.log(`\n   📊 Total criado no Base44: ${totalCreated}/${messagesToCreate.length}`);
+        
+        // Atualizar status do lote
+        await serviceRoleBase44.entities.BatchSchedule.update(batchSchedule.id, {
+            status: 'processing',
+            processed_at: new Date().toISOString()
+        });
+        
+        console.log(`\n✅ ========== LOTE ${batchSchedule.id} FINALIZADO ==========`);
+        console.log(`   📊 Resumo Final:`);
+        console.log(`      • Mensagens agendadas: ${totalScheduled}`);
+        console.log(`      • Mensagens criadas no Base44: ${totalCreated}`);
+        console.log(`      • Mensagens com falha: ${totalFailed}`);
+        
+        if (totalScheduled === 0 && allSchedulerPayloads.length > 0) {
+            throw new Error("Nenhuma mensagem foi agendada com sucesso no Cloudflare.");
+        }
+
+        return { 
+            success: true, 
+            messages_scheduled: totalScheduled,
+            messages_created: totalCreated,
+            messages_failed: totalFailed
+        };
+
+    } catch (error) {
+        console.error(`\n❌ ========== ERRO CRÍTICO NO LOTE ${batchSchedule.id} ==========`);
+        console.error(`   Erro: ${error.message}`);
+        
+        try {
+            await serviceRoleBase44.entities.BatchSchedule.update(batchSchedule.id, {
+                status: 'failed',
+                error_message: error.message
+            });
+        } catch (updateError) {
+            console.error(`   ⚠️ Falha ao atualizar status do lote:`, updateError.message);
+        }
+        
+        throw error;
+    }
+}
+
+Deno.serve(async (req) => {
+    try {
+        const base44 = createClientFromRequest(req);
+        const user = await base44.auth.me();
+        
+        if (!user || !user.company_id) {
+            return Response.json({ success: false, error: 'Unauthorized' }, { status: 401 });
+        }
+        
+        const company = await base44.entities.Company.get(user.company_id);
+        const scheduleData = await req.json();
+
+        // Extrai os destinatários para validação
+        const recipients = scheduleData.recipients;
+
+        // VALIDAÇÃO: Verificar se algum contato tem tags de sistema inválidas
+        if (recipients && recipients.length > 0) {
+            console.log('\n🔍 Validando contatos...');
+            
+            const contactIds = recipients.map(r => r.contact_id).filter(Boolean);
+            if (contactIds.length > 0) {
+                // Buscar SystemTags inválidas
+                const serviceRoleBase44 = base44.asServiceRole; 
+                const systemTags = await serviceRoleBase44.entities.SystemTag.list();
+                const invalidNumberTag = systemTags.find(tag => tag.slug === 'invalid_number');
+                const numberNotExistsTag = systemTags.find(tag => tag.slug === 'number_not_exists');
+                
+                const invalidTagIds = [
+                    invalidNumberTag?.id,
+                    numberNotExistsTag?.id
+                ].filter(Boolean);
+                
+                // Buscar os contatos
+                const contactsToValidate = await serviceRoleBase44.entities.Contact.filter({
+                    id: { '$in': contactIds },
+                    company_id: user.company_id
+                });
+                
+                // Verificar se algum tem tag inválida
+                const invalidContacts = contactsToValidate.filter(contact => {
+                    if (!contact.tags_system || contact.tags_system.length === 0) return false;
+                    return contact.tags_system.some(tagId => invalidTagIds.includes(tagId));
+                });
+                
+                if (invalidContacts.length > 0) {
+                    const invalidNames = invalidContacts.map(c => 
+                        `${c.first_name || ''} ${c.last_name || ''}`.trim() || c.phone
+                    ).join(', ');
+                    
+                    console.error(`❌ Contatos com número inválido detectados: ${invalidNames}`);
+                    
+                    return Response.json({
+                        success: false,
+                        error: `${invalidContacts.length} contato(s) possui(em) número inválido e não pode(m) ser incluído(s) na campanha: ${invalidNames}`,
+                        invalid_contacts: invalidContacts.map(c => ({
+                            id: c.id,
+                            name: `${c.first_name || ''} ${c.last_name || ''}`.trim(),
+                            phone: c.phone
+                        }))
+                    }, { status: 400 });
+                }
+                
+                console.log(`   ✓ Todos os ${contactsToValidate.length} contatos são válidos`);
+            }
+        }
+
+        const scheduleType = scheduleData.type || 'scheduled';
+
+        // Calculate finalDeliverySettings
+        const deliverySettings = scheduleData.delivery_settings;
+        let intervalConfig = {};
+        
+        switch (deliverySettings?.speed_mode || 'conservative') {
+            case 'aggressive':
+                intervalConfig = {
+                    interval_type: 'random',
+                    interval_random_min: 3000,
+                    interval_random_max: 8000
+                };
+                break;
+            case 'moderate':
+                intervalConfig = {
+                    interval_type: 'random',
+                    interval_random_min: 9000,
+                    interval_random_max: 20000
+                };
+                break;
+            case 'conservative':
+                intervalConfig = {
+                    interval_type: 'random',
+                    interval_random_min: 20000,
+                    interval_random_max: 60000
+                };
+                break;
+            case 'defensive':
+                intervalConfig = {
+                    interval_type: 'random',
+                    interval_random_min: 120000,
+                    interval_random_max: 300000
+                };
+                break;
+            default:
+                intervalConfig = {
+                    interval_type: 'random',
+                    interval_random_min: 20000,
+                    interval_random_max: 60000
+                };
+                break;
+        }
+
+        const finalDeliverySettings = {
+            ...deliverySettings,
+            ...intervalConfig,
+            respect_business_hours: deliverySettings?.respect_business_hours ?? true,
+            start_hour: deliverySettings?.start_hour ?? 8,
+            end_hour: deliverySettings?.end_hour ?? 18
+        };
+
+        // NOVO: Função para inicializar progresso no frontend
+        const initializeCampaignProgress = (scheduleId, scheduleName, totalRecipients, isDynamic, campaignType, batchesCount) => {
+            console.log(`[CreateSchedule] 📊 Inicializando progresso de campanha: ${scheduleName}`);
+            
+            // Este objeto será enviado via WebSocket para inicializar o frontend
+            return {
+                schedule_id: scheduleId,
+                schedule_name: scheduleName,
+                is_dynamic: isDynamic || false,
+                campaign_type: campaignType || 'immediate', // 'immediate', 'scheduled', 'smart', 'recurring'
+                total_batches: batchesCount || 1,
+                total: totalRecipients,
+                sent: 0,
+                failed: 0,
+                pending: totalRecipients,
+                recent_messages: [],
+                isProcessing: true
+            };
+        };
+
+        if (scheduleType === 'immediate' || scheduleType === 'scheduled' || scheduleType === 'smart') {
+            try {
+                let runAtTime;
+                
+                if (scheduleType === 'immediate') {
+                    runAtTime = Date.now();
+                } else {
+                    const utcDate = convertToUTC(scheduleData.scheduled_date, scheduleData.scheduled_time);
+                    runAtTime = utcDate.getTime();
+                }
+                
+                if (isNaN(runAtTime)) {
+                    throw new Error(`Data de agendamento inválida: ${scheduleData.scheduled_date} ${scheduleData.scheduled_time}`);
+                }
+                
+                console.log(`[CreateSchedule] Agendamento criado para: ${new Date(runAtTime).toISOString()}`);
+                
+                // Garantir que template_order seja salvo no Schedule
+                const scheduleToCreate = {
+                    ...scheduleData,
+                    company_id: user.company_id,
+                    user_id: user.id,
+                    status: scheduleType === 'smart' ? 'scheduled' : 'processing',
+                    template_order: scheduleData.template_order || []
+                };
+
+                const createdSchedule = await base44.entities.Schedule.create(scheduleToCreate);
+
+                // Inicializar progresso para TODAS as campanhas (não apenas imediatas)
+                const batchesCount = scheduleType === 'smart' 
+                    ? (scheduleData.smart_send_settings?.days_to_split || 1) 
+                    : 1;
+                    
+                const progressData = initializeCampaignProgress(
+                    createdSchedule.id,
+                    createdSchedule.name,
+                    scheduleData.total_recipients || scheduleData.recipients?.length || 0,
+                    scheduleData.is_dynamic_campaign || false,
+                    scheduleType, // 'immediate', 'scheduled', 'smart'
+                    batchesCount
+                );
+
+                // Enviar evento WebSocket para inicializar progresso
+                try {
+                    const serviceRoleBase44 = base44.asServiceRole;
+                    await serviceRoleBase44.functions.invoke('sendWebSocketUpdate', {
+                        company_id: user.company_id,
+                        type: 'campaign_started',
+                        schedule_id: createdSchedule.id,
+                        data: progressData
+                    });
+                    console.log(`[CreateSchedule] 📡 Progresso inicializado via WebSocket (${scheduleType})`);
+                } catch (wsError) {
+                    console.warn(`[CreateSchedule] ⚠️ Erro ao enviar WebSocket:`, wsError.message);
+                }
+
+                // Para tipo 'smart', criar múltiplos lotes divididos por dias
+                if (scheduleType === 'smart') {
+                    const daysToSplit = scheduleData.smart_send_settings?.days_to_split || 1;
+                    const totalRecipients = scheduleData.recipients?.length || 0;
+                    const recipientsPerDay = Math.ceil(totalRecipients / daysToSplit);
+                    
+                    console.log(`📊 Dividindo ${totalRecipients} destinatários em ${daysToSplit} dias (≈${recipientsPerDay} por dia)`);
+                    
+                    const batchList = [];
+                    
+                    for (let dayIndex = 0; dayIndex < daysToSplit; dayIndex++) {
+                        const startIndex = dayIndex * recipientsPerDay;
+                        const endIndex = Math.min(startIndex + recipientsPerDay, totalRecipients);
+                        const dayRecipients = scheduleData.recipients.slice(startIndex, endIndex);
+                        
+                        if (dayRecipients.length === 0) break;
+                        
+                        // Calcular horário do lote (mesmo horário, mas dia diferente)
+                        const batchDate = new Date(runAtTime);
+                        batchDate.setDate(batchDate.getDate() + dayIndex);
+                        const batchRunAt = batchDate.getTime();
+                        
+                        const batchData = {
+                            company_id: user.company_id,
+                            schedule_id: createdSchedule.id,
+                            batch_number: dayIndex + 1,
+                            run_at: batchRunAt,
+                            status: 'pending',
+                            is_dynamic: false,
+                            contact_filters: [],
+                            filter_logic: 'AND',
+                            recipients: dayRecipients,
+                            recipient_count: dayRecipients.length,
+                            template_ids: scheduleData.selected_templates,
+                            template_order: scheduleData.template_order || [],
+                            selected_sessions: scheduleData.selected_sessions,
+                            session_sending_strategy: scheduleData.session_sending_strategy || 'sequential',
+                            delivery_settings: finalDeliverySettings,
+                            metadata: {
+                                campaign_name: scheduleData.name,
+                                campaign_type: 'smart',
+                                day_index: dayIndex + 1,
+                                total_days: daysToSplit,
+                                requires_approval: true
+                            },
+                            created_at: new Date().toISOString(),
+                            updated_at: new Date().toISOString()
+                        };
+                        
+                        batchList.push(batchData);
+                    }
+                    
+                    console.log(`✅ Total de lotes criados: ${batchList.length}`);
+                    
+                    if (batchList.length > 0) {
+                        const serviceRoleBase44 = base44.asServiceRole;
+                        await serviceRoleBase44.entities.BatchSchedule.bulkCreate(batchList);
+                        console.log('✅ Lotes salvos no banco de dados');
+                    }
+                    
+                    return Response.json({
+                        success: true,
+                        schedule_id: createdSchedule.id,
+                        schedule_name: createdSchedule.name,
+                        batches_created: batchList.length,
+                        total_recipients: totalRecipients,
+                        type: scheduleType,
+                        message: `Campanha dividida em ${daysToSplit} dia(s) criada com sucesso. Aguardando aprovação dos lotes.`
+                    });
+                }
+
+                // Agendamento normal (immediate ou scheduled)
+                try {
+                    const batchSchedule = await base44.entities.BatchSchedule.create({
+                        company_id: user.company_id,
+                        schedule_id: createdSchedule.id,
+                        batch_number: 1,
+                        run_at: runAtTime,
+                        status: 'approved',
+                        approved_at: new Date().toISOString(),
+                        is_dynamic: scheduleData.is_dynamic_campaign,
+                        contact_filters: scheduleData.contact_filters,
+                        filter_logic: scheduleData.filter_logic,
+                        recipients: scheduleData.is_dynamic_campaign ? [] : scheduleData.recipients,
+                        recipient_count: scheduleData.total_recipients,
+                        template_ids: scheduleData.selected_templates,
+                        template_order: scheduleData.template_order || [],
+                        selected_sessions: scheduleData.selected_sessions,
+                        session_sending_strategy: scheduleData.session_sending_strategy || 'sequential',
+                        delivery_settings: finalDeliverySettings,
+                        created_at: new Date().toISOString(),
+                        updated_at: new Date().toISOString()
+                    });
+
+                    await sendBatchToCloudflare(base44, batchSchedule, scheduleData, user, company);
+                    
+                    return Response.json({
+                        success: true,
+                        schedule_id: createdSchedule.id,
+                        schedule_name: createdSchedule.name,
+                        total_recipients: scheduleData.total_recipients || scheduleData.recipients?.length || 0,
+                        type: scheduleType,
+                        progress_initialized: scheduleType === 'immediate', // Apenas imediatas inicializam progresso
+                        message: `Campanha enviada para processamento.`,
+                    });
+
+                } catch (error) {
+                    const serviceRoleBase44 = base44.asServiceRole;
+                    await serviceRoleBase44.entities.Schedule.update(createdSchedule.id, { 
+                        status: 'failed', 
+                        error_details: error.message 
+                    });
+                    return Response.json({ 
+                        success: false, 
+                        error: 'Falha ao processar campanha.', 
+                        details: error.message 
+                    }, { status: 500 });
+                }
+            } catch (error) {
+                console.error('Erro ao criar agendamento imediato/agendado/smart:', error);
+                return Response.json({ 
+                    success: false, 
+                    error: 'Erro ao processar a campanha.', 
+                    details: error.message 
+                }, { status: 500 });
+            }
+        } else if (scheduleType === 'recurring') {
+            const { recurrence_settings, scheduled_date, scheduled_time } = scheduleData;
+            
+            const createdSchedule = await base44.entities.Schedule.create({
+                ...scheduleData,
+                company_id: user.company_id,
+                user_id: user.id,
+                status: 'scheduled',
+            });
+
+            console.log('📦 Criando lotes para campanha recorrente...');
+            
+            const batchList = [];
+            let currentDate = convertToUTC(scheduled_date, scheduled_time);
+            
+            const endType = recurrence_settings.end_type || 'after_count';
+            const endCount = recurrence_settings.end_count || 30;
+            const endDate = recurrence_settings.end_date ? new Date(recurrence_settings.end_date) : null;
+
+            let instanceCount = 0;
+            const maxInstances = endType === 'after_count' ? endCount : 365;
+
+            while (instanceCount < maxInstances) {
+                instanceCount++;
+                
+                if (endType === 'end_date' && endDate && currentDate.getTime() > endDate.getTime()) {
+                    break;
+                }
+
+                if (endType === 'after_count' && instanceCount > endCount) {
+                    break;
+                }
+
+                const batchRunAt = currentDate.getTime();
+
+                const batchData = {
+                    company_id: user.company_id,
+                    schedule_id: createdSchedule.id,
+                    batch_number: instanceCount,
+                    run_at: batchRunAt,
+                    status: 'pending',
+                    is_dynamic: scheduleData.is_dynamic_campaign || false,
+                    contact_filters: scheduleData.contact_filters || [],
+                    filter_logic: scheduleData.filter_logic || 'AND',
+                    recipients: scheduleData.is_dynamic_campaign ? [] : scheduleData.recipients,
+                    recipient_count: scheduleData.is_dynamic_campaign ? 0 : scheduleData.recipients?.length || 0,
+                    template_ids: scheduleData.template_ids || scheduleData.selected_templates,
+                    template_order: scheduleData.template_order || [],
+                    selected_sessions: scheduleData.selected_sessions,
+                    session_sending_strategy: scheduleData.session_sending_strategy || 'sequential',
+                    delivery_settings: finalDeliverySettings,
+                    metadata: {
+                        campaign_name: scheduleData.name,
+                        campaign_type: 'recurring',
+                        instance_sequence: instanceCount,
+                        requires_approval: true
+                    },
+                    created_at: new Date().toISOString(),
+                    updated_at: new Date().toISOString()
+                };
+
+                batchList.push(batchData);
+
+                const freq = recurrence_settings.frequency || 1;
+                switch (recurrence_settings.type) {
+                    case 'daily':
+                        currentDate.setDate(currentDate.getDate() + freq);
+                        break;
+                    case 'weekly':
+                        currentDate.setDate(currentDate.getDate() + (7 * freq));
+                        break;
+                    case 'monthly':
+                        currentDate.setMonth(currentDate.getMonth() + freq);
+                        break;
+                    case 'quarterly':
+                        currentDate.setMonth(currentDate.getMonth() + (3 * freq));
+                        break;
+                    case 'yearly':
+                        currentDate.setFullYear(currentDate.getFullYear() + freq);
+                        break;
+                    default:
+                        console.warn(`Tipo de recorrência desconhecido: ${recurrence_settings.type}`);
+                        instanceCount = maxInstances;
+                        break;
+                }
+            }
+
+            console.log(`✅ Total de lotes criados: ${batchList.length}`);
+
+            if (batchList.length > 0) {
+                const serviceRoleBase44 = base44.asServiceRole;
+                await serviceRoleBase44.entities.BatchSchedule.bulkCreate(batchList);
+                console.log('✅ Lotes salvos no banco de dados');
+            }
+
+            // Inicializar progresso para recorrentes
+            const progressData = initializeCampaignProgress(
+                createdSchedule.id,
+                createdSchedule.name,
+                scheduleData.total_recipients || scheduleData.recipients?.length || 0,
+                scheduleData.is_dynamic_campaign || false,
+                'recurring',
+                batchList.length
+            );
+
+            try {
+                const serviceRoleBase44 = base44.asServiceRole;
+                await serviceRoleBase44.functions.invoke('sendWebSocketUpdate', {
+                    company_id: user.company_id,
+                    type: 'campaign_started',
+                    schedule_id: createdSchedule.id,
+                    data: progressData
+                });
+                console.log(`[CreateSchedule] 📡 Progresso inicializado via WebSocket (recurring)`);
+            } catch (wsError) {
+                console.warn(`[CreateSchedule] ⚠️ Erro ao enviar WebSocket:`, wsError.message);
+            }
+
+            console.log('⏸️ Mensagens NÃO criadas - aguardando aprovação dos lotes');
+
+            return Response.json({
+                success: true,
+                schedule_id: createdSchedule.id,
+                schedule: createdSchedule,
+                batches_created: batchList.length,
+                message: 'Campanha recorrente criada com sucesso. Aguardando aprovação dos lotes.'
+            });
+        }
+
+        return Response.json({ 
+            success: false, 
+            error: 'Tipo de agendamento desconhecido.' 
+        }, { status: 400 });
+
+    } catch (error) {
+        console.error('Erro em createSchedule:', error);
+        return Response.json({ 
+            success: false, 
+            error: 'Erro interno do servidor.', 
+            details: error.message 
+        }, { status: 500 });
+    }
+});

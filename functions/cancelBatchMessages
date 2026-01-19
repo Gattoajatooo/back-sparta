@@ -1,0 +1,136 @@
+import { createClientFromRequest } from 'npm:@base44/sdk@0.7.1';
+
+Deno.serve(async (req) => {
+    try {
+        const base44 = createClientFromRequest(req);
+        const user = await base44.auth.me();
+
+        if (!user || !user.company_id) {
+            return new Response(JSON.stringify({ 
+                success: false, 
+                error: 'Usuário não autenticado ou sem empresa.' 
+            }), { 
+                status: 401, 
+                headers: { 'Content-Type': 'application/json' } 
+            });
+        }
+
+        const { scheduler_job_ids, schedule_id } = await req.json();
+
+        if (!scheduler_job_ids || !Array.isArray(scheduler_job_ids) || scheduler_job_ids.length === 0) {
+            return new Response(JSON.stringify({ 
+                success: false, 
+                error: 'scheduler_job_ids é obrigatório e deve ser um array não vazio.' 
+            }), { 
+                status: 400, 
+                headers: { 'Content-Type': 'application/json' } 
+            });
+        }
+
+        if (!schedule_id) {
+            return new Response(JSON.stringify({ 
+                success: false, 
+                error: 'schedule_id é obrigatório.' 
+            }), { 
+                status: 400, 
+                headers: { 'Content-Type': 'application/json' } 
+            });
+        }
+
+        console.log(`\n🚀 ========== INICIANDO CANCELAMENTO DE CAMPANHA ==========`);
+        console.log(`📊 Schedule ID: ${schedule_id}`);
+        console.log(`📊 Total de mensagens a cancelar: ${scheduler_job_ids.length}`);
+
+        const scheduleUrl = Deno.env.get("SCHEDULE_URL");
+        const jobsApiKey = Deno.env.get("JOBS_API_KEY");
+
+        if (!scheduleUrl || !jobsApiKey) {
+            console.warn('⚠️ Configuração do scheduler externo não encontrada. Cancelamento apenas local.');
+            
+            // Apenas atualizar o Schedule como cancelado
+            await base44.asServiceRole.entities.Schedule.update(schedule_id, {
+                status: 'cancelled',
+                cancelled_at: new Date().toISOString()
+            });
+
+            console.log(`✅ Schedule ${schedule_id} marcado como cancelado (local)`);
+
+            return new Response(JSON.stringify({ 
+                success: true, 
+                message: `Campanha cancelada com sucesso. Scheduler externo indisponível.`,
+                cancelled_count: scheduler_job_ids.length
+            }), { 
+                status: 200, 
+                headers: { 'Content-Type': 'application/json' } 
+            });
+        }
+
+        // PASSO 1: Enviar para o Cloudflare Scheduler para cancelar (bulk operation)
+        console.log('\n☁️ [PASSO 1/2] Enviando requisição de cancelamento em massa para o Cloudflare...');
+        
+        const cancelUrl = `${scheduleUrl.replace(/\/$/, '')}/jobs/cancel/batch`;
+        const schedulerResponse = await fetch(cancelUrl, {
+            method: 'POST',
+            headers: { 
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${jobsApiKey}` 
+            },
+            body: JSON.stringify(scheduler_job_ids)
+        });
+
+        if (!schedulerResponse.ok) {
+            const errorText = await schedulerResponse.text();
+            console.error(`❌ Erro do scheduler: ${schedulerResponse.status} - ${errorText}`);
+            throw new Error(`Erro do scheduler: ${schedulerResponse.status} - ${errorText}`);
+        }
+
+        const schedulerResult = await schedulerResponse.json();
+        console.log(`✅ Cloudflare retornou resposta de cancelamento`);
+        
+        // Analisar resultado
+        const acceptedCount = schedulerResult.data?.accepted || 0;
+        const acceptedIds = schedulerResult.data?.ids || [];
+        
+        console.log(`   📊 Mensagens aceitas para cancelamento: ${acceptedCount}`);
+        console.log(`   📊 IDs aceitos: ${acceptedIds.length}`);
+        
+        // PASSO 2: Atualizar Schedule para "cancelling" (fila de cancelamento)
+        console.log(`\n💾 [PASSO 2/2] Atualizando Schedule ${schedule_id} para status 'cancelling'...`);
+        
+        await base44.asServiceRole.entities.Schedule.update(schedule_id, {
+            status: 'cancelling'
+        });
+
+        console.log(`✅ Schedule ${schedule_id} marcado como 'cancelling' (em fila de cancelamento)`);
+
+        console.log(`\n✅ ========== CANCELAMENTO INICIADO ==========`);
+        console.log(`   📊 Resumo:`);
+        console.log(`      • Aceitas para cancelamento: ${acceptedCount}`);
+        console.log(`      • Schedule status: cancelling`);
+        console.log(`      • As mensagens serão canceladas pelo Cloudflare`);
+
+        return new Response(JSON.stringify({ 
+            success: true, 
+            message: `Campanha em fila de cancelamento. ${acceptedCount} mensagens sendo canceladas.`,
+            details: schedulerResult,
+            accepted_count: acceptedCount,
+            schedule_id: schedule_id,
+            schedule_status: 'cancelling'
+        }), { 
+            status: 200, 
+            headers: { 'Content-Type': 'application/json' } 
+        });
+
+    } catch (error) {
+        console.error('\n❌ ========== ERRO NO CANCELAMENTO ==========');
+        console.error(error);
+        return new Response(JSON.stringify({ 
+            success: false, 
+            error: 'Erro interno do servidor.',
+            details: error.message 
+        }), { 
+            status: 500, 
+            headers: { 'Content-Type': 'application/json' } 
+        });
+    }
+});

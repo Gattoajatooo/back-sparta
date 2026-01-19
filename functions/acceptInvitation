@@ -1,0 +1,61 @@
+import { createClientFromRequest } from 'npm:@base44/sdk@0.7.0';
+
+Deno.serve(async (req) => {
+    const base44 = createClientFromRequest(req);
+
+    try {
+        const user = await base44.auth.me();
+        if (!user) {
+            return new Response(JSON.stringify({ success: false, error: 'Usuário não autenticado. Faça o login para aceitar o convite.' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
+        }
+
+        const { token } = await req.json();
+        if (!token) {
+            return new Response(JSON.stringify({ success: false, error: 'Token de convite ausente.' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+        }
+        
+        // Use Service Role to find the invitation
+        const invitations = await base44.asServiceRole.entities.Invitation.filter({ token: token, status: 'pending' });
+
+        if (invitations.length === 0) {
+            return new Response(JSON.stringify({ success: false, error: 'Convite inválido ou já utilizado.' }), { status: 404, headers: { 'Content-Type': 'application/json' } });
+        }
+
+        const invitation = invitations[0];
+
+        // Check if invitation is expired
+        if (new Date(invitation.expires_at) < new Date()) {
+            await base44.asServiceRole.entities.Invitation.update(invitation.id, { status: 'expired' });
+            return new Response(JSON.stringify({ success: false, error: 'Este convite expirou. Peça um novo convite.' }), { status: 410, headers: { 'Content-Type': 'application/json' } });
+        }
+        
+        // Check if the logged-in user's email matches the invitation email
+        if (user.email.toLowerCase() !== invitation.email.toLowerCase()) {
+            return new Response(JSON.stringify({ success: false, error: `Convite enviado para ${invitation.email}, mas você está logado como ${user.email}. Por favor, use a conta correta.` }), { status: 403, headers: { 'Content-Type': 'application/json' } });
+        }
+
+        // Check if user is already part of a company
+        if (user.company_id) {
+             return new Response(JSON.stringify({ success: false, error: `Você já faz parte de outra empresa. Não é possível aceitar este convite.` }), { status: 409, headers: { 'Content-Type': 'application/json' } });
+        }
+
+        // All checks passed, update user and invitation
+        await base44.asServiceRole.entities.User.update(user.id, {
+            company_id: invitation.company_id,
+            role_id: invitation.role_id,
+            system_role: invitation.system_role,
+            full_name: user.full_name || invitation.full_name, // Update name if it was missing
+            first_login_completed: true // Mark setup as complete
+        });
+
+        await base44.asServiceRole.entities.Invitation.update(invitation.id, {
+            status: 'accepted'
+        });
+
+        return new Response(JSON.stringify({ success: true, message: 'Convite aceito com sucesso!' }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+
+    } catch (error) {
+        console.error('Error in acceptInvitation function:', error);
+        return new Response(JSON.stringify({ success: false, error: 'Erro interno do servidor.', details: error.message }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+    }
+});

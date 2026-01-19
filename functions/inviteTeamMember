@@ -1,0 +1,65 @@
+
+import { createClientFromRequest } from 'npm:@base44/sdk@0.7.0';
+
+Deno.serve(async (req) => {
+    const base44 = createClientFromRequest(req);
+
+    try {
+        const user = await base44.auth.me();
+        if (!user) {
+            return new Response(JSON.stringify({ success: false, error: 'Não autorizado' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
+        }
+        
+        // Lógica de permissão removida - qualquer usuário autenticado pode convidar.
+
+        const data = await req.json();
+        const { email, full_name, company_id, company_name, role_id, invited_by_name } = data;
+
+        if (!email || !full_name || !company_id || !company_name || !role_id) {
+            return new Response(JSON.stringify({ success: false, error: 'Campos obrigatórios ausentes.' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+        }
+
+        // Verificar se o e-mail já está cadastrado na entidade User
+        const existingUsers = await base44.asServiceRole.entities.User.filter({
+            email: email
+        });
+
+        if (existingUsers.length > 0) {
+            return new Response(JSON.stringify({ success: false, error: 'Este e-mail já está cadastrado no sistema.' }), { status: 409, headers: { 'Content-Type': 'application/json' } });
+        }
+
+        // Verificar se já existe um convite pendente
+        const existingInvites = await base44.asServiceRole.entities.Invitation.filter({
+            email: email,
+            status: 'pending'
+        });
+
+        if (existingInvites.length > 0) {
+            return new Response(JSON.stringify({ success: false, error: 'Já existe um convite pendente para este e-mail, independentemente da empresa.' }), { status: 409, headers: { 'Content-Type': 'application/json' } });
+        }
+
+        const invitationToken = crypto.randomUUID();
+        const expires_at = new Date();
+        expires_at.setDate(expires_at.getDate() + 7);
+
+        // Criar o convite na entidade Invitation
+        const newInvitation = await base44.asServiceRole.entities.Invitation.create({
+            email,
+            full_name,
+            company_id,
+            company_name,
+            role_id: role_id || null,
+            system_role: null, // Convites são sempre para roles personalizadas, não de sistema
+            token: invitationToken,
+            status: 'pending',
+            expires_at: expires_at.toISOString(),
+            invited_by_name
+        });
+
+        return new Response(JSON.stringify({ success: true, invitation: newInvitation }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+
+    } catch (error) {
+        console.error('Error in inviteTeamMember function:', error);
+        return new Response(JSON.stringify({ success: false, error: 'Erro interno do servidor.', details: error.message }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+    }
+});

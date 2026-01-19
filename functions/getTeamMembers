@@ -1,0 +1,36 @@
+import { createClientFromRequest } from 'npm:@base44/sdk@0.7.0';
+
+Deno.serve(async (req) => {
+    const base44 = createClientFromRequest(req);
+
+    try {
+        // 1. Autenticar o usuário que está fazendo a chamada
+        const user = await base44.auth.me();
+        if (!user) {
+            return new Response(JSON.stringify({ success: false, error: 'Usuário não autenticado.' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
+        }
+
+        let teamMembers;
+
+        // 2. Se o usuário é admin do sistema (role == 'admin'), buscar TODOS os usuários
+        if (user.role === 'admin') {
+            console.log('Admin do sistema detectado - buscando TODOS os usuários');
+            teamMembers = await base44.asServiceRole.entities.User.list();
+        } else if (user.company_id) {
+            // 3. Se é usuário normal, buscar apenas da própria empresa
+            console.log('Usuário normal detectado - buscando apenas da empresa');
+            teamMembers = await base44.asServiceRole.entities.User.filter({
+                company_id: user.company_id
+            });
+        } else {
+            return new Response(JSON.stringify({ success: false, error: 'Usuário não pertence a uma empresa.' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+        }
+
+        // 4. Retornar a lista de membros da equipe
+        return new Response(JSON.stringify({ success: true, team_members: teamMembers }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+
+    } catch (error) {
+        console.error('Erro ao buscar membros da equipe:', error);
+        return new Response(JSON.stringify({ success: false, error: 'Erro interno do servidor.', details: error.message }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+    }
+});

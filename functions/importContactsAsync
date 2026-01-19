@@ -1,0 +1,272 @@
+import { createClientFromRequest } from 'npm:@base44/sdk@0.5.0';
+
+// Funções auxiliares (mantidas como estão)
+function convertGender(genderStr) {
+    if (!genderStr || typeof genderStr !== 'string') return 'not_informed';
+    const gender = genderStr.toLowerCase().trim();
+    if (['masculino', 'male', 'm', 'homem'].includes(gender)) return 'male';
+    if (['feminino', 'female', 'f', 'mulher'].includes(gender)) return 'female';
+    if (['outro', 'other', 'o'].includes(gender)) return 'other';
+    return 'not_informed';
+}
+
+function convertBrazilianDate(dateStr) {
+    if (!dateStr) return null;
+    if (typeof dateStr === 'string') {
+        const datePattern = /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/;
+        const match = dateStr.match(datePattern);
+        if (match) {
+            const [, day, month, year] = match;
+            return `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`;
+        }
+    }
+    return null;
+}
+
+function convertValue(valueStr) {
+    if (!valueStr) return null;
+    if (typeof valueStr === 'number') return valueStr;
+    if (typeof valueStr === 'string') {
+        const cleanValue = valueStr.replace(/[^\d,.-]/g, '').replace(',', '.');
+        const numValue = parseFloat(cleanValue);
+        return isNaN(numValue) ? null : numValue;
+    }
+    return null;
+}
+
+Deno.serve(async (req) => {
+    const startTime = Date.now();
+    
+    try {
+        const base44 = createClientFromRequest(req);
+        
+        if (!(await base44.auth.isAuthenticated())) {
+            return new Response(JSON.stringify({ success: false, error: 'Unauthorized' }), {
+                status: 401, headers: { 'Content-Type': 'application/json' }
+            });
+        }
+
+        const user = await base44.auth.me();
+        if (!user?.company_id) {
+            return new Response(JSON.stringify({ success: false, error: 'No company found' }), {
+                status: 400, headers: { 'Content-Type': 'application/json' }
+            });
+        }
+
+        const { 
+            contactsData, 
+            importName = 'Importação Manual',
+            globalTags = [],
+            individualAssignments = {}
+        } = await req.json();
+
+        if (!contactsData || !Array.isArray(contactsData) || contactsData.length === 0) {
+            return new Response(JSON.stringify({ success: false, error: 'Dados de contatos não fornecidos ou inválidos' }), {
+                status: 400, headers: { 'Content-Type': 'application/json' }
+            });
+        }
+
+        console.log(`Iniciando processamento de ${contactsData.length} contatos para empresa ${user.company_id}`);
+
+        // 1. Carregar tags existentes
+        const allTagsInDB = await base44.entities.Tag.filter({ company_id: user.company_id });
+        const existingTagNames = new Set(allTagsInDB.map(tag => tag.name));
+        const tagNameToIdMap = new Map(allTagsInDB.map(tag => [tag.name.toLowerCase().trim(), tag.id]));
+        
+        console.log(`✅ ${allTagsInDB.length} tags existentes carregadas`);
+
+        // 2. Coletar todas as tags necessárias
+        const allTagNamesNeeded = new Set();
+        
+        // Tags globais
+        if (Array.isArray(globalTags)) {
+            globalTags.forEach(tag => {
+                if (tag) {
+                    const tagName = typeof tag === 'object' ? tag.name : tag;
+                    if (tagName) allTagNamesNeeded.add(tagName);
+                }
+            });
+        }
+        
+        // Tags individuais
+        contactsData.forEach((contato, i) => {
+            const contactId = contato._tempId || `contact_${i}`;
+            if (individualAssignments[contactId]?.tags && Array.isArray(individualAssignments[contactId].tags)) {
+                individualAssignments[contactId].tags.forEach(tag => {
+                    if (tag) allTagNamesNeeded.add(tag);
+                });
+            }
+            
+            // Tags no próprio contato
+            if (contato.tags) {
+                if (typeof contato.tags === 'string') {
+                    contato.tags.split(/[,;]/).forEach(t => {
+                        const tagName = t.trim();
+                        if (tagName) allTagNamesNeeded.add(tagName);
+                    });
+                } else if (Array.isArray(contato.tags)) {
+                    contato.tags.forEach(t => {
+                        if (t) allTagNamesNeeded.add(t);
+                    });
+                }
+            }
+        });
+
+        // 3. Criar tags que não existem
+        const newTagsToCreate = Array.from(allTagNamesNeeded).filter(name => !existingTagNames.has(name));
+        
+        if (newTagsToCreate.length > 0) {
+            console.log(`🏷️ Criando ${newTagsToCreate.length} novas tags...`);
+            const newTagObjects = newTagsToCreate.map(name => ({ 
+                company_id: user.company_id, 
+                name, 
+                type: 'manual', 
+                is_smart: false 
+            }));
+            
+            const createdTags = await base44.entities.Tag.bulkCreate(newTagObjects);
+            
+            // Atualizar mapa com as novas tags criadas
+            createdTags.forEach(tag => {
+                tagNameToIdMap.set(tag.name.toLowerCase().trim(), tag.id);
+            });
+            
+            console.log(`✅ ${createdTags.length} novas tags criadas`);
+        }
+
+        // 4. Preparar contatos convertendo nomes de tags para IDs
+        const preparedContacts = [];
+
+        for (let i = 0; i < contactsData.length; i++) {
+            const contato = contactsData[i];
+            
+            let dadosContato = {
+                company_id: user.company_id, 
+                first_name: contato.first_name || `Contato ${i + 1}`,
+                last_name: contato.last_name || '', 
+                document_number: contato.document_number || '',
+                gender: convertGender(contato.gender), 
+                birth_date: convertBrazilianDate(contato.birth_date),
+                responsible_name: contato.responsible_name || '', 
+                company_name: contato.company_name || '',
+                position: contato.position || '', 
+                custom_position: contato.custom_position || null,
+                status: contato.status || 'lead', 
+                source: contato.source || 'importacao',
+                notes: contato.notes || '', 
+                value: convertValue(contato.value),
+                import_name: importName, 
+                import_type: 'manual',
+                emails: [], 
+                phones: []
+            };
+            
+            if (contato.email) { 
+                dadosContato.email = contato.email; 
+                dadosContato.emails.push({ email: contato.email, type: 'primary' }); 
+            }
+            if (contato.phone) { 
+                dadosContato.phone = contato.phone; 
+                dadosContato.phones.push({ phone: contato.phone, type: 'primary' }); 
+            }
+            if (dadosContato.document_number) { 
+                const cleanDoc = dadosContato.document_number.replace(/\D/g, ''); 
+                dadosContato.document_type = cleanDoc.length === 11 ? 'cpf' : 'cnpj'; 
+            }
+
+            // ✨ MUDANÇA PRINCIPAL: Converter nomes de tags para IDs
+            const tagNamesForContact = new Set();
+            
+            // Tags globais
+            if (Array.isArray(globalTags)) { 
+                globalTags.forEach(tag => { 
+                    if (tag) {
+                        const tagName = typeof tag === 'object' ? tag.name : tag;
+                        if (tagName) tagNamesForContact.add(tagName);
+                    }
+                }); 
+            }
+            
+            // Tags individuais
+            const contactId = contato._tempId || `contact_${i}`;
+            if (individualAssignments[contactId]?.tags && Array.isArray(individualAssignments[contactId].tags)) { 
+                individualAssignments[contactId].tags.forEach(tag => { 
+                    if (tag) tagNamesForContact.add(tag); 
+                }); 
+            }
+            
+            // Tags do próprio contato
+            if (contato.tags) { 
+                if (typeof contato.tags === 'string') { 
+                    contato.tags.split(/[,;]/).forEach(t => {
+                        const tagName = t.trim();
+                        if (tagName) tagNamesForContact.add(tagName);
+                    }); 
+                } else if (Array.isArray(contato.tags)) { 
+                    contato.tags.forEach(t => {
+                        if (t) tagNamesForContact.add(t);
+                    }); 
+                } 
+            }
+            
+            // ✨ CONVERTER NOMES PARA IDs
+            const tagIds = [];
+            tagNamesForContact.forEach(tagName => {
+                const tagId = tagNameToIdMap.get(tagName.toLowerCase().trim());
+                if (tagId) {
+                    tagIds.push(tagId);
+                } else {
+                    console.warn(`⚠️ Tag "${tagName}" não encontrada no mapa de IDs`);
+                }
+            });
+            
+            // ✨ SALVAR IDs NO ARRAY, NÃO NOMES
+            dadosContato.tags = tagIds;
+            
+            preparedContacts.push(dadosContato);
+        }
+
+        // 5. Inserir contatos em lotes
+        let sucessos = 0;
+        let falhas = 0;
+        const erros = [];
+        const BATCH_SIZE = 100;
+
+        for (let i = 0; i < preparedContacts.length; i += BATCH_SIZE) {
+            const batch = preparedContacts.slice(i, i + BATCH_SIZE);
+            console.log(`Processando lote de ${batch.length} contatos (iniciando do índice ${i})...`);
+            try {
+                const createdBatch = await base44.entities.Contact.bulkCreate(batch);
+                sucessos += createdBatch.length;
+                console.log(`Lote de ${createdBatch.length} contatos criado com sucesso.`);
+            } catch (error) {
+                falhas += batch.length;
+                const msgErro = `Erro no lote a partir do índice ${i}: ${error.message}`;
+                erros.push(msgErro);
+                console.error(msgErro, error);
+            }
+        }
+
+        const duracao = Date.now() - startTime;
+        console.log(`Importação concluída: ${sucessos} sucessos, ${falhas} falhas em ${duracao}ms`);
+
+        return new Response(JSON.stringify({
+            success: true,
+            message: `Importação concluída: ${sucessos} sucessos, ${falhas} falhas.`,
+            data: {
+                successful_records: sucessos,
+                failed_records: falhas,
+                total_records: contactsData.length,
+                errors: erros
+            }
+        }), { status: 200, headers: { 'Content-Type': 'application/json' }});
+
+    } catch (error) {
+        console.error('Erro crítico na importação em lotes:', error);
+        return new Response(JSON.stringify({
+            success: false, 
+            error: 'Erro interno do servidor durante a importação em lotes', 
+            details: error.message
+        }), { status: 500, headers: { 'Content-Type': 'application/json' }});
+    }
+});

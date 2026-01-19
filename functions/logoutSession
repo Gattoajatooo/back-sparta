@@ -1,0 +1,92 @@
+import { createClientFromRequest } from 'npm:@base44/sdk@0.5.0';
+
+Deno.serve(async (req) => {
+    try {
+        const base44 = createClientFromRequest(req);
+        const user = await base44.auth.me();
+        
+        if (!user || !user.company_id) {
+            return new Response(JSON.stringify({ error: 'Usuário não autenticado ou sem empresa' }), {
+                status: 401,
+                headers: { 'Content-Type': 'application/json' }
+            });
+        }
+
+        const { sessionName } = await req.json();
+
+        if (!sessionName) {
+            return new Response(JSON.stringify({ error: 'Nome da sessão é obrigatório' }), {
+                status: 400,
+                headers: { 'Content-Type': 'application/json' }
+            });
+        }
+
+        const apiKey = Deno.env.get('WAHA_API_KEY');
+        const apiUrl = Deno.env.get('WAHA_API_URL');
+        
+        if (!apiKey || !apiUrl) {
+            return new Response(JSON.stringify({ 
+                error: 'Configurações WAHA não encontradas' 
+            }), {
+                status: 500,
+                headers: { 'Content-Type': 'application/json' }
+            });
+        }
+
+        const wahaResponse = await fetch(`${apiUrl}/api/sessions/${sessionName}/logout`, {
+            method: 'POST',
+            headers: { 'X-Api-Key': apiKey }
+        });
+
+        const wahaData = await wahaResponse.json();
+
+        if (!wahaResponse.ok) {
+            // Logout can return 404 if session doesn't exist, which is acceptable
+            if (wahaResponse.status !== 404) {
+              return new Response(JSON.stringify({
+                  error: 'Erro ao fazer logout da sessão no WAHA',
+                  status: wahaResponse.status,
+                  details: wahaData
+              }), {
+                  status: wahaResponse.status,
+                  headers: { 'Content-Type': 'application/json' }
+              });
+            }
+        }
+
+        const sessions = await base44.entities.Session.filter({
+            company_id: user.company_id,
+            session_name: sessionName
+        });
+
+        if (sessions.length > 0) {
+            const session = sessions[0];
+            await base44.entities.Session.update(session.id, {
+                status: 'SCAN_QR_CODE', // Reset status to allow re-linking
+                phone: null,
+                avatar_url: null,
+                last_activity: new Date().toISOString(),
+                api_response: wahaData
+            });
+        }
+
+        return new Response(JSON.stringify({
+            success: true,
+            message: 'Logout da sessão realizado com sucesso',
+            session: wahaData
+        }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' }
+        });
+
+    } catch (error) {
+        console.error('Erro ao fazer logout da sessão:', error);
+        return new Response(JSON.stringify({
+            error: 'Erro interno do servidor',
+            details: error.message
+        }), {
+            status: 500,
+            headers: { 'Content-Type': 'application/json' }
+        });
+    }
+});

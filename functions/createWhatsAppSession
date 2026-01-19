@@ -1,0 +1,190 @@
+import { createClientFromRequest } from 'npm:@base44/sdk@0.7.1';
+
+// Função para gerar hash único para nome da sessão
+function generateSessionName() {
+    const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+    let result = '';
+    for (let i = 0; i < 16; i++) {
+        result += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+    return result;
+}
+
+// Função para limpar URL e evitar barras duplas
+function cleanUrl(baseUrl, path) {
+    const cleanBase = baseUrl.endsWith('/') ? baseUrl.slice(0, -1) : baseUrl;
+    const cleanPath = path.startsWith('/') ? path : `/${path}`;
+    return `${cleanBase}${cleanPath}`;
+}
+
+Deno.serve(async (req) => {
+    try {
+        const base44 = createClientFromRequest(req);
+        
+        // Verificar autenticação
+        if (!(await base44.auth.isAuthenticated())) {
+            return Response.json({ error: 'Usuário não autenticado' }, { status: 401 });
+        }
+
+        const user = await base44.auth.me();
+        
+        if (!user || !user.company_id) {
+            return Response.json({ error: 'Usuário não autenticado ou sem empresa' }, { status: 401 });
+        }
+
+        // 1. VERIFICAR LIMITE DE SESSÕES DO PLANO
+        const subscriptions = await base44.asServiceRole.entities.SubscriptionsStripe.filter({
+            company_id: user.company_id,
+            status: 'active'
+        });
+
+        if (subscriptions.length === 0) {
+            return Response.json({ error: 'Nenhuma assinatura ativa encontrada para esta empresa.' }, { status: 403 });
+        }
+        
+        const activeSubscription = subscriptions[0];
+        const planId = activeSubscription.metadata?.plan_id;
+        
+        if (!planId) {
+             return Response.json({ error: 'Não foi possível identificar seu plano atual.' }, { status: 403 });
+        }
+
+        const currentPlan = await base44.asServiceRole.entities.Plan.get(planId);
+
+        if (!currentPlan) {
+            return Response.json({ error: 'Plano da assinatura ativa não encontrado.' }, { status: 403 });
+        }
+
+        const sessionLimit = currentPlan.active_sessions;
+        
+        if (sessionLimit !== -1) {
+            const activeSessions = await base44.asServiceRole.entities.Session.filter({
+                company_id: user.company_id,
+                is_deleted: { '$ne': true },
+                status: { '$in': ['WORKING', 'SCAN_QR_CODE', 'STARTING'] }
+            });
+            
+            if (activeSessions.length >= sessionLimit) {
+                return Response.json({ 
+                    error: `Limite de ${sessionLimit} sessões ativas atingido para o seu plano (${currentPlan.name}). Faça upgrade ou delete uma sessão.` 
+                }, { status: 403 });
+            }
+        }
+
+        // Verificar configurações WAHA
+        const apiKey = Deno.env.get('WAHA_API_KEY');
+        const apiUrl = Deno.env.get('WAHA_API_URL');
+        
+        if (!apiKey || !apiUrl || apiKey.trim().length === 0) {
+            return Response.json({ 
+                error: 'Configurações WAHA não encontradas ou inválidas.' 
+            }, { status: 500 });
+        }
+
+        // Gerar nome único para a sessão
+        const sessionName = generateSessionName();
+
+        // Preparar dados para API do WAHA com webhook
+        const wahaPayload = {
+            name: sessionName,
+            driver: "NOWEB",
+            start: true,
+            config: {
+                metadata: {
+                    "user.id": user.company_id,
+                    "user.email": user.email
+                },
+                proxy: null,
+                debug: false,
+                noweb: {
+                    store: {
+                        enabled: true,
+                        fullSync: false
+                    }
+                },
+                webhooks: [
+                    {
+                        url: "https://waha-webhook.businesstolucas.workers.dev",
+                        events: ["message", "session.status", "message.ack"]
+                    }
+                ]
+            }
+        };
+
+        const fullUrl = cleanUrl(apiUrl, '/api/sessions');
+        
+        console.log(`[createWhatsAppSession] 📤 POST ${fullUrl}`);
+
+        // Fazer chamada para API do WAHA
+        const wahaResponse = await fetch(fullUrl, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Api-Key': apiKey.trim()
+            },
+            body: JSON.stringify(wahaPayload)
+        });
+
+        const responseText = await wahaResponse.text();
+        let wahaData;
+        
+        try {
+            wahaData = responseText ? JSON.parse(responseText) : {};
+        } catch (parseError) {
+            console.error('[createWhatsAppSession] ❌ Parse error');
+            
+            return Response.json({
+                error: 'Resposta inválida da API WAHA',
+                status: wahaResponse.status,
+                response: responseText.substring(0, 200)
+            }, { status: 500 });
+        }
+
+        if (!wahaResponse.ok) {
+            console.error(`[createWhatsAppSession] ❌ WAHA error: ${wahaResponse.status}`);
+            
+            if (wahaResponse.status === 401) {
+                return Response.json({
+                    error: 'ERRO DE AUTENTICAÇÃO: API Key inválida',
+                    message: 'Verifique se a WAHA_API_KEY está correta'
+                }, { status: 401 });
+            }
+            
+            return Response.json({
+                error: 'Erro ao criar sessão no WAHA',
+                status: wahaResponse.status,
+                details: wahaData
+            }, { status: wahaResponse.status });
+        }
+
+        // Salvar sessão no banco de dados
+        const savedSession = await base44.entities.Session.create({
+            company_id: user.company_id,
+            session_name: sessionName,
+            user_email: user.email,
+            status: 'STARTING',
+            api_response: wahaData
+        });
+        
+        console.log(`[createWhatsAppSession] ✅ Sessão criada: ${sessionName}`);
+
+        return Response.json({
+            success: true,
+            session: {
+                id: savedSession.id,
+                name: sessionName,
+                status: 'STARTING',
+                created_at: new Date().toISOString(),
+                api_response: wahaData
+            }
+        });
+
+    } catch (error) {
+        console.error('[createWhatsAppSession] ❌ Erro:', error.message);
+        
+        return Response.json({
+            error: 'Erro interno do servidor',
+            details: error.message
+        }, { status: 500 });
+    }
+});

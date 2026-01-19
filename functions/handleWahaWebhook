@@ -1,0 +1,101 @@
+import { createClientFromRequest } from "npm:@base44/sdk@0.7.1";
+
+async function processMessage(base44, payload) {
+  const chatId = payload.chatId;
+  if (!chatId || !chatId.includes("@c.us")) {
+    console.log("Ignorando webhook que não é de chat de usuário:", payload.event, chatId);
+    return;
+  }
+
+  const phone = chatId.split("@")[0];
+  const companyId = payload.session.split("_")[0]; // Assuming session name is companyId_...
+
+  if (!companyId) {
+    console.error("Não foi possível determinar o companyId da sessão:", payload.session);
+    return;
+  }
+
+  // 1. Encontrar ou criar o contato
+  let contact = null;
+  const contacts = await base44.asServiceRole.entities.Contact.filter({
+    company_id: companyId,
+    phone: phone,
+  });
+
+  if (contacts.length > 0) {
+    contact = contacts[0];
+    console.log(`Contato encontrado: ${contact.id}`);
+  } else {
+    console.log(`Contato não encontrado para o telefone ${phone}. Criando novo...`);
+    contact = await base44.asServiceRole.entities.Contact.create({
+      company_id: companyId,
+      first_name: payload.pushName || "Novo Contato",
+      phone: phone,
+      source: "whatsapp_inbound",
+      import_type: "whatsapp",
+    });
+    console.log(`Novo contato criado: ${contact.id}`);
+  }
+
+  // 2. Salvar a mensagem recebida
+  const messageData = {
+    company_id: companyId,
+    contact_id: contact.id,
+    session_name: payload.session,
+    chat_id: chatId,
+    content: payload.body || `[Tipo de mensagem não suportado: ${payload.type}]`,
+    direction: "received",
+    type: "immediately",
+    run_at: payload.timestamp * 1000,
+    status: "success", // Mensagem recebida com sucesso
+    created_at: payload.timestamp * 1000,
+    updated_at: payload.timestamp * 1000,
+    metadata: {
+      waha_event: payload.event,
+      waha_payload: payload, // Store the whole payload for debugging
+      waha_message_id: payload.id, // Store external ID in metadata
+    },
+  };
+
+  const createdMessage = await base44.asServiceRole.entities.Message.create(messageData);
+  console.log(`Mensagem recebida salva no banco: ID ${createdMessage.id}`);
+
+  // 3. (Opcional) Enviar atualização via WebSocket para a UI
+  // await sendWebSocketUpdate(base44, companyId, { type: 'NEW_MESSAGE', payload: createdMessage });
+}
+
+Deno.serve(async (req) => {
+  const webhookSecret = Deno.env.get("WAHA_WEBHOOK_SECRET");
+  const authHeader = req.headers.get("X-Webhook-Signature") || req.headers.get("authorization");
+
+  // Authentication
+  if (webhookSecret && authHeader !== webhookSecret) {
+    console.warn("Aviso: Tentativa de webhook não autorizada.");
+    return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401 });
+  }
+
+  try {
+    const payload = await req.json();
+    console.log("Webhook WAHA recebido:", payload.event);
+
+    const base44 = createClientFromRequest(req);
+
+    switch (payload.event) {
+      case "message":
+        await processMessage(base44, payload);
+        break;
+      // Add other event handlers here if needed
+      // case 'session.status':
+      //   // handle session status change
+      //   break;
+      default:
+        console.log(`Evento não tratado: ${payload.event}`);
+        break;
+    }
+
+    return new Response(JSON.stringify({ success: true }), { status: 200 });
+  } catch (error) {
+    console.error("Erro ao processar webhook WAHA:", error);
+    return new Response(JSON.stringify({ success: false, error: error.message }), { status: 500 });
+  }
+});

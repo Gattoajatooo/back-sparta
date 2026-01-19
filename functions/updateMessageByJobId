@@ -1,0 +1,247 @@
+import { createClientFromRequest } from "npm:@base44/sdk@0.7.1";
+
+/* ========================= Helpers ========================= */
+
+function json(status, data) {
+  return new Response(JSON.stringify(data, null, 2), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+const getFirstItem = (result) => {
+  if (!result) return null;
+  if (Array.isArray(result) && result.length > 0) return result[0];
+  if (Array.isArray(result.items) && result.items.length > 0) return result.items[0];
+  return null;
+};
+
+// remove campos que não devem ir para update()
+function stripDisallowed(updateFields) {
+  const clone = { ...updateFields };
+  delete clone.company_id;        // só para checagem, não atualiza
+  delete clone.scheduler_job_id;  // id de lookup
+  delete clone.debug;             // não existe no schema
+  return clone;
+}
+
+function maskAuthHeader(h) {
+  if (!h) return null;
+  const m = h.match(/^Bearer\s+(.+)$/i);
+  if (!m) return h;
+  const token = m[1];
+  if (token.length <= 10) return "Bearer **********";
+  return `Bearer ${token.slice(0, 6)}…${token.slice(-4)}`;
+}
+
+// reduz o objeto da Message para diagnóstico sem vazar tudo
+function sanitizeMessageForDiag(msg) {
+  if (!msg) return msg;
+  return {
+    id: msg.id ?? msg._id ?? null,
+    is_deleted: msg.is_deleted ?? null,
+    created_at: msg.created_at ?? msg?.data?.created_at ?? null,
+    updated_at: msg.updated_at ?? msg?.data?.updated_at ?? null,
+    scheduler_job_id: msg.scheduler_job_id ?? msg?.data?.scheduler_job_id ?? null,
+    company_id: msg.company_id ?? msg?.data?.company_id ?? null,
+    chat_id: msg.chat_id ?? msg?.data?.chat_id ?? null,
+    schedule_id: msg.schedule_id ?? msg?.data?.schedule_id ?? null,
+    status: msg.status ?? msg?.data?.status ?? null,
+    direction: msg.direction ?? msg?.data?.direction ?? null,
+    session_name: msg.session_name ?? msg?.data?.session_name ?? null,
+    batch_id: msg.batch_id ?? msg?.data?.batch_id ?? null,
+  };
+}
+
+// util para rodar consultas auxiliares com segurança
+async function tryList(base44, filter, limit = 5) {
+  try {
+    const res = await base44.asServiceRole.entities.Message.list({ filter, limit, sort: { created_at: -1 } });
+    const items = Array.isArray(res?.items) ? res.items : Array.isArray(res) ? res : [];
+    return {
+      ok: true,
+      filter,
+      count: items.length,
+      samples: items.slice(0, limit).map(sanitizeMessageForDiag),
+    };
+  } catch (e) {
+    return { ok: false, filter, error: String(e?.message || e) };
+  }
+}
+
+/* ========================= Handler ========================= */
+
+Deno.serve(async (req) => {
+  const start = Date.now();
+  const traceId = crypto.randomUUID();
+
+  console.log(`[${traceId}] INÍCIO updateMessageByJobId`, {
+    method: req.method,
+    url: req.url,
+    ip: req.headers?.get("cf-connecting-ip") ?? null,
+  });
+
+  if (req.method !== "PUT" && req.method !== "POST") {
+    console.warn(`[${traceId}] Method Not Allowed: ${req.method}`);
+    return json(405, { error: "Method Not Allowed" });
+  }
+
+  try {
+    /* ---------- Auth ---------- */
+    const authHeader = req.headers.get("Authorization");
+    const expectedApiKey = Deno.env.get("EXTERNAL_API_KEY");
+
+    console.log(`[${traceId}] Headers (sanitized)`, {
+      authorization: maskAuthHeader(authHeader),
+      contentType: req.headers.get("content-type"),
+    });
+
+    if (!expectedApiKey) {
+      console.error(`[${traceId}] ERRO CRÍTICO: EXTERNAL_API_KEY não configurada`);
+      return json(500, { error: "Server Configuration Error" });
+    }
+    if (authHeader !== `Bearer ${expectedApiKey}`) {
+      console.warn(`[${traceId}] Unauthorized - Bearer inválido/ausente`);
+      return json(401, { error: "Unauthorized" });
+    }
+    console.log(`[${traceId}] Autenticação OK`);
+
+    /* ---------- Body ---------- */
+    let body = null;
+    try { body = await req.json(); }
+    catch { return json(400, { error: "Bad Request", message: "Invalid JSON body" }); }
+
+    console.log(`[${traceId}] Body recebido`, body);
+
+    const {
+      scheduler_job_id,
+      company_id: payload_company_id,
+      chat_id: payload_chat_id,
+      ...rawUpdateFields
+    } = body || {};
+
+    if (!scheduler_job_id || typeof scheduler_job_id !== "string") {
+      console.warn(`[${traceId}] scheduler_job_id ausente/ inválido`, { scheduler_job_id });
+      return json(400, { error: "Bad Request", message: "scheduler_job_id is required" });
+    }
+
+    if (Object.keys(rawUpdateFields ?? {}).length === 0) {
+      console.log(`[${traceId}] Nenhum campo para atualizar`);
+      return json(200, { success: true, message: "No fields to update." });
+    }
+
+    const base44 = createClientFromRequest(req);
+
+    /* ---------- Busca principal (CORRIGIDA - campos na raiz) ---------- */
+    const filtersMain = {
+      "scheduler_job_id": scheduler_job_id,
+      is_deleted: { $ne: true },
+    };
+    if (payload_company_id) filtersMain["company_id"] = payload_company_id;
+
+    console.log(`[${traceId}] Filtros de busca (principal)`, filtersMain);
+
+    const listResult = await base44.asServiceRole.entities.Message.list({
+      filter: filtersMain, limit: 1, sort: { created_at: -1 },
+    });
+
+    const messageToUpdate = getFirstItem(listResult);
+
+    /* ---------- Se não encontrou: diagnóstico detalhado ---------- */
+    if (!messageToUpdate) {
+      console.error(`[${traceId}] Message NÃO encontrada. Iniciando diagnóstico…`);
+
+      const diagnostics = {
+        searched_for: {
+          scheduler_job_id,
+          company_id: payload_company_id ?? null,
+          chat_id: payload_chat_id ?? null,
+        },
+        primary_query: { filter: filtersMain },
+        probes: [],
+      };
+
+      // 1) Procurar por scheduler_job_id na raiz
+      diagnostics.probes.push(
+        await tryList(base44, { scheduler_job_id, is_deleted: { $ne: true } })
+      );
+
+      // 2) Procurar por chat_id
+      if (payload_chat_id) {
+        diagnostics.probes.push(
+          await tryList(base44, { "chat_id": payload_chat_id, is_deleted: { $ne: true } })
+        );
+      }
+
+      // 3) Procurar por company_id (para ver se há mensagens da empresa)
+      if (payload_company_id) {
+        diagnostics.probes.push(
+          await tryList(base44, { "company_id": payload_company_id, is_deleted: { $ne: true } })
+        );
+      }
+
+      // 4) Amostra de registros que têm scheduler_job_id (para ver "como está salvo")
+      diagnostics.probes.push(
+        await tryList(base44, { "scheduler_job_id": { $exists: true }, is_deleted: { $ne: true } }, 5)
+      );
+
+      const durationMs = Date.now() - start;
+      console.log(`[${traceId}] FIM (404 com diagnóstico) em ${durationMs}ms`, diagnostics);
+
+      return json(404, {
+        error: "Not Found",
+        message: "Message not found with the provided identifier.",
+        traceId,
+        durationMs,
+        diagnostics,
+      });
+    }
+
+    /* ---------- Verificações e update ---------- */
+    const dbCompanyId = messageToUpdate?.company_id ?? messageToUpdate?.data?.company_id ?? null;
+
+    console.log(`[${traceId}] Message encontrada`, {
+      id: messageToUpdate?.id, dbCompanyId,
+      sample: sanitizeMessageForDiag(messageToUpdate),
+    });
+
+    if (payload_company_id && dbCompanyId && dbCompanyId !== payload_company_id) {
+      console.warn(`[${traceId}] ALERTA: company_id do payload difere do armazenado`, {
+        payload_company_id, dbCompanyId,
+      });
+    }
+
+    const allowedUpdate = stripDisallowed(rawUpdateFields);
+
+    const finalUpdate = {
+      ...allowedUpdate,
+      last_external_update_ts: Date.now(), // auditoria segura
+    };
+
+    console.log(`[${traceId}] PATCH a aplicar`, { id: messageToUpdate.id, patch: finalUpdate });
+
+    const updated = await base44.asServiceRole.entities.Message.update(
+      messageToUpdate.id,
+      finalUpdate
+    );
+
+    const durationMs = Date.now() - start;
+    console.log(`[${traceId}] SUCESSO update`, { id: updated?.id, durationMs });
+
+    return json(200, { success: true, data: updated, traceId, durationMs });
+
+  } catch (err) {
+    const durationMs = Date.now() - start;
+    const errorPayload = {
+      error: "Internal Server Error",
+      traceId,
+      durationMs,
+      details: String(err?.message || err),
+      name: err?.name ?? undefined,
+      cause: err?.cause ? String(err.cause) : undefined,
+      stack: err?.stack ?? undefined,
+    };
+    console.error(`[${traceId}] ERRO INESPERADO`, errorPayload);
+    return json(500, errorPayload);
+  }
+});

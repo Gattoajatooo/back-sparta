@@ -1,0 +1,98 @@
+
+import { createClient } from 'npm:@base44/sdk@0.1.0';
+
+const base44 = createClient({
+    appId: Deno.env.get('BASE44_APP_ID'),
+});
+
+Deno.serve(async (req) => {
+    try {
+        // Autenticação Base44
+        const authHeader = req.headers.get('Authorization');
+        if (!authHeader) {
+            return new Response(JSON.stringify({ error: 'Token de autorização necessário' }), {
+                status: 401,
+                headers: { 'Content-Type': 'application/json' }
+            });
+        }
+
+        const token = authHeader.split(' ')[1];
+        base44.auth.setToken(token);
+        const user = await base44.auth.me();
+        
+        if (!user || !user.company_id) {
+            return new Response(JSON.stringify({ error: 'Usuário não autenticado ou sem empresa' }), {
+                status: 401,
+                headers: { 'Content-Type': 'application/json' }
+            });
+        }
+
+        // Pegar dados da requisição
+        const { sessionName, phoneNumber } = await req.json();
+
+        if (!sessionName || !phoneNumber) {
+            return new Response(JSON.stringify({ error: 'Nome da sessão e número de telefone são obrigatórios' }), {
+                status: 400,
+                headers: { 'Content-Type': 'application/json' }
+            });
+        }
+
+        // Verificar configurações WAHA
+        const apiKey = Deno.env.get('WAHA_API_KEY');
+        const apiUrl = Deno.env.get('WAHA_API_URL');
+        
+        if (!apiKey || !apiUrl) {
+            return new Response(JSON.stringify({ 
+                error: 'Configurações WAHA não encontradas' 
+            }), {
+                status: 500,
+                headers: { 'Content-Type': 'application/json' }
+            });
+        }
+
+        // Fazer chamada para API do WAHA para solicitar código de pareamento
+        const wahaResponse = await fetch(`${apiUrl}/api/${sessionName}/auth/request-code`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Api-Key': apiKey // Mudança: usar X-Api-Key em vez de Authorization Bearer
+            },
+            body: JSON.stringify({
+                phoneNumber: phoneNumber
+            })
+        });
+
+        const wahaData = await wahaResponse.json();
+
+        if (!wahaResponse.ok) {
+            return new Response(JSON.stringify({
+                error: 'Erro ao solicitar código de pareamento no WAHA',
+                status: wahaResponse.status,
+                details: wahaData
+            }), {
+                status: wahaResponse.status,
+                headers: { 'Content-Type': 'application/json' }
+            });
+        }
+
+        return new Response(JSON.stringify({
+            success: true,
+            pairing_code: wahaData.code || wahaData,
+            session_name: sessionName,
+            phone_number: phoneNumber
+        }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' }
+        });
+
+    } catch (error) {
+        console.error('Erro ao solicitar código de pareamento:', error);
+        return new Response(JSON.stringify({
+            error: 'Erro interno do servidor',
+            details: error.message
+        }), {
+            status: 500,
+            headers: { 'Content-Type': 'application/json' }
+        });
+    }
+});

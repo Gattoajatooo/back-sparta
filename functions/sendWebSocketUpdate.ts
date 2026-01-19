@@ -1,0 +1,107 @@
+import { createClientFromRequest } from 'npm:@base44/sdk@0.7.1';
+
+Deno.serve(async (req) => {
+    try {
+        const body = await req.json();
+        
+        console.log('[sendWebSocketUpdate] 📥 Payload recebido:', JSON.stringify(body, null, 2));
+        
+        const wsBaseUrl = Deno.env.get('WEBSOCKET_ENDPOINT_URL');
+        const wsToken = Deno.env.get('WEBSOCKET_AUTH_TOKEN');
+        
+        if (!wsBaseUrl || !wsToken) {
+            console.log('WebSocket credentials not configured, skipping real-time update');
+            return new Response(JSON.stringify({ 
+                success: false, 
+                error: 'WebSocket not configured' 
+            }), {
+                status: 500,
+                headers: { 'Content-Type': 'application/json' }
+            });
+        }
+
+        // 🔥 DETERMINAR company_id (pode estar em vários lugares)
+        const targetCompanyId = body.company_id || body.data?.company_id;
+        
+        if (!targetCompanyId) {
+            console.log('WebSocket: company_id não fornecido, pulando notificação');
+            return new Response(JSON.stringify({ 
+                success: false, 
+                error: 'company_id is required' 
+            }), {
+                status: 400,
+                headers: { 'Content-Type': 'application/json' }
+            });
+        }
+
+        // 🔥 CONSTRUIR PAYLOAD FINAL
+        let payload;
+        
+        if (body.schedule_id || body.message_id) {
+            // Payload de mensagens/campanhas
+            payload = {
+                ...body,
+                company_id: targetCompanyId,
+                timestamp: new Date().toISOString()
+            };
+            console.log('[sendWebSocketUpdate] ✅ Payload de campanha/mensagem');
+        } else {
+            // Payload genérico (importação, sessões, etc.)
+            payload = {
+                type: body.event_type || body.type || 'update',
+                company_id: targetCompanyId,
+                data: body.data || body,
+                timestamp: new Date().toISOString()
+            };
+            console.log('[sendWebSocketUpdate] ✅ Payload genérico/importação');
+        }
+        
+        console.log('[sendWebSocketUpdate] 📦 Tipo do evento:', payload.type);
+
+        // Construir URL com company_id no path
+        const wsEndpoint = `${wsBaseUrl}/realtime/${targetCompanyId}`;
+
+        console.log(`[sendWebSocketUpdate] 📡 Enviando para: ${wsEndpoint}`);
+        console.log(`[sendWebSocketUpdate] 📦 Payload final:`, JSON.stringify(payload, null, 2));
+
+        const wsResponse = await fetch(wsEndpoint, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${wsToken}`
+            },
+            body: JSON.stringify(payload)
+        });
+
+        if (wsResponse.ok) {
+            const result = await wsResponse.json();
+            console.log(`[sendWebSocketUpdate] ✅ Enviado com sucesso - ${result.delivered || 0} cliente(s) conectado(s)`);
+            return new Response(JSON.stringify({ 
+                success: true,
+                delivered: result.delivered || 0
+            }), {
+                status: 200,
+                headers: { 'Content-Type': 'application/json' }
+            });
+        } else {
+            const errorText = await wsResponse.text();
+            console.error(`[sendWebSocketUpdate] ❌ Erro: ${wsResponse.status} - ${errorText}`);
+            return new Response(JSON.stringify({ 
+                success: false, 
+                error: `WebSocket error: ${wsResponse.status}` 
+            }), {
+                status: 500,
+                headers: { 'Content-Type': 'application/json' }
+            });
+        }
+    } catch (error) {
+        console.error('[sendWebSocketUpdate] ❌ Erro ao enviar:', error);
+        return new Response(JSON.stringify({ 
+            success: false, 
+            error: error.message 
+        }), {
+            status: 500,
+            headers: { 'Content-Type': 'application/json' }
+        });
+    }
+});

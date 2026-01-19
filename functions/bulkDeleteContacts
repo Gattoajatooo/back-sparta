@@ -1,0 +1,172 @@
+import { createClientFromRequest } from 'npm:@base44/sdk@0.7.1';
+
+Deno.serve(async (req) => {
+    try {
+        const base44 = createClientFromRequest(req);
+        
+        const user = await base44.auth.me();
+        if (!user?.company_id) {
+            return Response.json({
+                success: false,
+                error: 'Unauthorized - No company found'
+            }, { status: 401 });
+        }
+
+        const { contactIds, restore = false } = await req.json();
+
+        if (!contactIds || !Array.isArray(contactIds) || contactIds.length === 0) {
+            return Response.json({
+                success: false,
+                error: 'contactIds array is required'
+            }, { status: 400 });
+        }
+
+        console.log(`🔄 Starting bulk ${restore ? 'restore' : 'delete'} for ${contactIds.length} contacts`);
+
+        const results = {
+            successful: 0,
+            failed: 0,
+            errors: []
+        };
+
+        // Processar em lotes de 50 com 10 segundos entre cada lote
+        const BATCH_SIZE = 50;
+        const DELAY_BETWEEN_BATCHES = 10000; // 10 segundos
+        
+        const totalBatches = Math.ceil(contactIds.length / BATCH_SIZE);
+        const failedBatches = []; // Fila de lotes que falharam
+        
+        for (let batchIndex = 0; batchIndex < totalBatches; batchIndex++) {
+            const start = batchIndex * BATCH_SIZE;
+            const end = Math.min(start + BATCH_SIZE, contactIds.length);
+            const batchIds = contactIds.slice(start, end);
+            
+            console.log(`📦 Processing batch ${batchIndex + 1}/${totalBatches} (${batchIds.length} contacts)`);
+
+            let batchHadErrors = false;
+            const batchFailedIds = [];
+
+            // Processar lote atual
+            const batchPromises = batchIds.map(async (contactId) => {
+                try {
+                    if (restore) {
+                        await base44.asServiceRole.entities.Contact.update(contactId, {
+                            deleted: false,
+                            deleted_at: null,
+                            deleted_by: null
+                        });
+                    } else {
+                        await base44.asServiceRole.entities.Contact.update(contactId, {
+                            deleted: true,
+                            deleted_at: new Date().toISOString(),
+                            deleted_by: user.id
+                        });
+                    }
+                    results.successful++;
+                    return { success: true, contactId };
+                } catch (error) {
+                    console.error(`❌ Error processing contact ${contactId}:`, error);
+                    batchHadErrors = true;
+                    batchFailedIds.push(contactId);
+                    results.failed++;
+                    results.errors.push({
+                        contactId,
+                        error: error.message
+                    });
+                    return { success: false, contactId, error: error.message };
+                }
+            });
+
+            await Promise.all(batchPromises);
+
+            // Se houve erros, adicionar contatos falhados na fila para retry
+            if (batchHadErrors && batchFailedIds.length > 0) {
+                console.log(`⚠️ ${batchFailedIds.length} contacts failed in batch ${batchIndex + 1}, adding to retry queue`);
+                failedBatches.push(batchFailedIds);
+            }
+
+            // Adicionar delay entre lotes (exceto no último se não houver failed batches)
+            if (batchIndex < totalBatches - 1 || failedBatches.length > 0) {
+                console.log(`⏳ Waiting ${DELAY_BETWEEN_BATCHES}ms before next batch...`);
+                await new Promise(resolve => setTimeout(resolve, DELAY_BETWEEN_BATCHES));
+            }
+        }
+
+        // Processar lotes que falharam - RETRY INFINITO até todos terem sucesso
+        let retryAttempt = 0;
+        while (failedBatches.length > 0) {
+            retryAttempt++;
+            const retryBatch = failedBatches.shift(); // Pega o primeiro lote da fila
+            
+            console.log(`🔄 RETRY #${retryAttempt} - Processing ${retryBatch.length} failed contacts`);
+            
+            // Aguardar 10 segundos antes do retry
+            await new Promise(resolve => setTimeout(resolve, DELAY_BETWEEN_BATCHES));
+
+            let retryBatchHadErrors = false;
+            const retryFailedIds = [];
+            
+            const retryPromises = retryBatch.map(async (contactId) => {
+                try {
+                    if (restore) {
+                        await base44.asServiceRole.entities.Contact.update(contactId, {
+                            deleted: false,
+                            deleted_at: null,
+                            deleted_by: null
+                        });
+                    } else {
+                        await base44.asServiceRole.entities.Contact.update(contactId, {
+                            deleted: true,
+                            deleted_at: new Date().toISOString(),
+                            deleted_by: user.id
+                        });
+                    }
+                    
+                    // Sucesso no retry - atualizar contadores
+                    results.successful++;
+                    results.failed--;
+                    
+                    // Remover do array de erros
+                    results.errors = results.errors.filter(e => e.contactId !== contactId);
+                    
+                    return { success: true, contactId };
+                } catch (error) {
+                    console.error(`❌ Retry error for contact ${contactId}:`, error);
+                    retryBatchHadErrors = true;
+                    retryFailedIds.push(contactId);
+                    return { success: false, contactId, error: error.message };
+                }
+            });
+
+            await Promise.all(retryPromises);
+            
+            // Se ainda houver erros, adicionar no FINAL da fila
+            if (retryBatchHadErrors && retryFailedIds.length > 0) {
+                console.log(`⚠️ ${retryFailedIds.length} contacts still failing, adding to END of queue`);
+                failedBatches.push(retryFailedIds);
+            }
+        }
+
+        console.log(`✅ Bulk ${restore ? 'restore' : 'delete'} completed:`, {
+            successful: results.successful,
+            failed: results.failed,
+            total: contactIds.length
+        });
+
+        return Response.json({
+            success: true,
+            successful: results.successful,
+            failed: results.failed,
+            total: contactIds.length,
+            errors: results.errors
+        });
+
+    } catch (error) {
+        console.error('❌ Bulk delete/restore error:', error);
+        return Response.json({
+            success: false,
+            error: 'Internal server error',
+            details: error.message
+        }, { status: 500 });
+    }
+});

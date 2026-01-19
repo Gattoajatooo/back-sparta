@@ -1,0 +1,95 @@
+import { createClientFromRequest } from 'npm:@base44/sdk@0.7.1';
+
+Deno.serve(async (req) => {
+    try {
+        const base44 = createClientFromRequest(req);
+        
+        // ⚠️ Esta função pode ser chamada por sistemas externos (webhooks WAHA, scheduler, etc)
+        // Usa service role para maior flexibilidade
+        
+        const body = await req.json();
+        const { session_name, ...updateData } = body;
+
+        if (!session_name) {
+            return Response.json({ 
+                success: false, 
+                error: 'session_name is required' 
+            }, { status: 400 });
+        }
+
+        console.log(`[updateSession] Atualizando sessão ${session_name} com dados:`, updateData);
+
+        // 🔥 Usar service role para buscar sessão
+        const sessions = await base44.asServiceRole.entities.Session.filter({
+            session_name: session_name
+        });
+
+        if (!sessions || sessions.length === 0) {
+            return Response.json({ 
+                success: false, 
+                error: 'Session not found' 
+            }, { status: 404 });
+        }
+
+        const session = sessions[0];
+        
+        // Preparar dados de atualização
+        const finalUpdateData = {
+            ...updateData,
+            last_activity: new Date().toISOString()
+        };
+
+        // 🔥 Atualizar com service role
+        const updatedSession = await base44.asServiceRole.entities.Session.update(
+            session.id, 
+            finalUpdateData
+        );
+
+        console.log(`[updateSession] ✅ Sessão ${session_name} atualizada com sucesso`);
+
+        // 🔥 ENVIAR NOTIFICAÇÃO WEBSOCKET
+        try {
+            console.log(`[updateSession] 📡 Enviando notificação WebSocket...`);
+            
+            // 🔥 Payload estruturado com campos no nível raiz
+            const wsPayload = {
+                type: 'session_updated',
+                company_id: session.company_id,
+                session_id: session.id,
+                session_name: session_name,
+                status: updateData.status || session.status,
+                phone: updateData.phone || session.phone,
+                avatar_url: updateData.avatar_url || session.avatar_url,
+                data: {
+                    ...updatedSession,
+                    ...updateData
+                }
+            };
+
+            const wsResponse = await base44.asServiceRole.functions.invoke('sendWebSocketUpdate', wsPayload);
+            
+            if (wsResponse?.data?.success) {
+                console.log(`[updateSession] ✅ WebSocket enviado - ${wsResponse.data.delivered || 0} cliente(s)`);
+            } else {
+                console.warn(`[updateSession] ⚠️ WebSocket falhou:`, wsResponse?.data);
+            }
+        } catch (wsError) {
+            console.error(`[updateSession] ❌ Erro ao enviar WebSocket:`, wsError.message);
+            // Não falhar a requisição se o WebSocket falhar
+        }
+
+        return Response.json({ 
+            success: true,
+            session_id: session.id,
+            session_name: session_name,
+            updated_data: finalUpdateData
+        });
+
+    } catch (error) {
+        console.error('[updateSession] ❌ Erro:', error);
+        return Response.json({ 
+            success: false, 
+            error: error.message 
+        }, { status: 500 });
+    }
+});

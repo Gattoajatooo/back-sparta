@@ -1,0 +1,249 @@
+// Função auxiliar reutilizável para enviar lotes para Cloudflare
+// Usada por createSchedule e approveBatch
+
+// Helper para preencher variáveis
+function fillVariables(content, contact, user, company) {
+    if (!content) return '';
+    let message = content;
+    if (contact) {
+        const firstName = contact.first_name || contact.name?.split(' ')[0] || '';
+        const lastName = contact.last_name || contact.name?.split(' ').slice(1).join(' ') || '';
+        const fullName = (contact.first_name && contact.last_name) 
+            ? `${contact.first_name} ${contact.last_name}`.trim() 
+            : contact.name || firstName;
+        
+        message = message.replace(/{{\s*first_name\s*}}/gi, firstName);
+        message = message.replace(/{{\s*last_name\s*}}/gi, lastName);
+        message = message.replace(/{{\s*full_name\s*}}/gi, fullName);
+        message = message.replace(/{{\s*name\s*}}/gi, fullName);
+        message = message.replace(/{{\s*email\s*}}/gi, contact.email || '');
+        message = message.replace(/{{\s*phone\s*}}/gi, contact.phone || '');
+        message = message.replace(/{{\s*company_name\s*}}/gi, contact.company_name || '');
+    }
+    if (user) {
+        message = message.replace(/{{\s*user.full_name\s*}}/gi, user.full_name || '');
+        message = message.replace(/{{\s*user.first_name\s*}}/gi, user.full_name?.split(' ')[0] || '');
+        message = message.replace(/{{\s*user.email\s*}}/gi, user.email || '');
+    }
+    if (company) {
+        message = message.replace(/{{\s*company.name\s*}}/gi, company.name || '');
+    }
+    return message;
+}
+
+export async function sendBatchToCloudflare({
+    base44,
+    batch_id,
+    company_id,
+    schedule_id,
+    schedule_name,
+    user_id,
+    recipients,
+    template_ids,
+    selected_sessions,
+    session_sending_strategy,
+    delivery_settings,
+    run_at,
+    user,
+    company
+}) {
+    try {
+        console.log('\n📤 ========== ENVIANDO PARA CLOUDFLARE ==========');
+        console.log(`📦 Batch ID: ${batch_id}`);
+        console.log(`👥 Destinatários: ${recipients.length}`);
+        console.log(`📱 Sessões: ${selected_sessions.length}`);
+        console.log(`📝 Templates: ${template_ids.length}`);
+
+        // 1. Buscar templates
+        const templates = await base44.entities.MessageTemplate.filter({
+            company_id: company_id,
+            id: template_ids
+        });
+
+        if (!templates || templates.length === 0) {
+            throw new Error('Nenhum template encontrado');
+        }
+
+        console.log(`   ✓ ${templates.length} templates carregados`);
+
+        // 2. Buscar detalhes das sessões
+        const SCHEDULE_URL = Deno.env.get("SCHEDULE_URL");
+        const JOBS_API_KEY = Deno.env.get("JOBS_API_KEY");
+
+        if (!SCHEDULE_URL || !JOBS_API_KEY) {
+            throw new Error('Configurações de agendamento não encontradas');
+        }
+
+        // Buscar sessões ativas
+        const activeSessions = await base44.entities.Session.filter({
+            company_id: company_id,
+            session_name: selected_sessions,
+            status: 'WORKING'
+        });
+
+        if (!activeSessions || activeSessions.length === 0) {
+            throw new Error('Nenhuma sessão ativa encontrada');
+        }
+
+        console.log(`   ✓ ${activeSessions.length} sessões ativas encontradas`);
+
+        // 3. Preparar distribuição de sessões
+        let sessionIndex = 0;
+        const getNextSession = () => {
+            if (session_sending_strategy === 'random') {
+                return activeSessions[Math.floor(Math.random() * activeSessions.length)];
+            } else if (session_sending_strategy === 'smart') {
+                // Smart: escolher sessão com menos mensagens enviadas
+                return activeSessions.reduce((prev, curr) => 
+                    (prev.messages_sent || 0) < (curr.messages_sent || 0) ? prev : curr
+                );
+            } else {
+                // Sequential (padrão)
+                const session = activeSessions[sessionIndex];
+                sessionIndex = (sessionIndex + 1) % activeSessions.length;
+                return session;
+            }
+        };
+
+        // 4. Calcular intervalos entre mensagens
+        const { interval_random_min, interval_random_max } = delivery_settings;
+        let currentRunAt = run_at;
+
+        // 5. Criar mensagens no banco e agendar no Cloudflare
+        const messagesToCreate = [];
+        const cloudflareJobs = [];
+
+        for (let i = 0; i < recipients.length; i++) {
+            const recipient = recipients[i];
+            const session = getNextSession();
+            const template = templates[Math.floor(Math.random() * templates.length)];
+
+            // Buscar contato completo para preencher variáveis
+            let contact = null;
+            try {
+                contact = await base44.entities.Contact.get(recipient.contact_id);
+            } catch (error) {
+                console.warn(`   ⚠ Contato ${recipient.contact_id} não encontrado, usando dados básicos`);
+                contact = recipient;
+            }
+
+            // Preencher variáveis no conteúdo
+            const messageContent = fillVariables(template.content, contact, user, company);
+
+            // Calcular próximo horário de envio
+            if (i > 0) {
+                const interval = Math.floor(
+                    Math.random() * (interval_random_max - interval_random_min + 1) + interval_random_min
+                );
+                currentRunAt += interval;
+            }
+
+            // Preparar chat_id
+            const phone = recipient.phone?.replace(/\D/g, '');
+            const chat_id = phone ? `${phone}@c.us` : null;
+
+            if (!chat_id) {
+                console.warn(`   ⚠ Telefone inválido para ${recipient.name}, pulando...`);
+                continue;
+            }
+
+            // Criar objeto de mensagem
+            const messageData = {
+                batch_id: batch_id,
+                company_id: company_id,
+                contact_id: recipient.contact_id,
+                user_id: user_id,
+                schedule_id: schedule_id,
+                session_name: session.session_name,
+                chat_id: chat_id,
+                content: messageContent,
+                direction: 'sent',
+                type: 'scheduled',
+                run_at: currentRunAt,
+                status: 'pending',
+                attempt_count: 0,
+                created_at: Date.now(),
+                updated_at: Date.now(),
+                metadata: {
+                    campaign_name: schedule_name,
+                    recipient_name: recipient.name,
+                    template_id: template.id,
+                    template_name: template.name,
+                    session_phone: session.phone,
+                    batch_id: batch_id
+                }
+            };
+
+            messagesToCreate.push(messageData);
+
+            // Preparar job para Cloudflare
+            cloudflareJobs.push({
+                session_name: session.session_name,
+                chat_id: chat_id,
+                content: messageContent,
+                run_at: currentRunAt,
+                metadata: messageData.metadata
+            });
+        }
+
+        console.log(`\n   📝 Criando ${messagesToCreate.length} mensagens no banco...`);
+
+        // 6. Criar mensagens em lote no banco
+        const createdMessages = await base44.entities.Message.bulkCreate(messagesToCreate);
+        console.log(`   ✓ ${createdMessages.length} mensagens criadas no banco`);
+
+        // 7. Enviar jobs em lote para Cloudflare
+        console.log(`\n   ☁️  Enviando ${cloudflareJobs.length} jobs para Cloudflare...`);
+
+        const cloudflarePayload = cloudflareJobs.map((job, index) => ({
+            ...job,
+            job_id: createdMessages[index].id // Usar o ID da mensagem criada como job_id
+        }));
+
+        const cloudflareResponse = await fetch(`${SCHEDULE_URL}/jobs/batch`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-API-Key': JOBS_API_KEY
+            },
+            body: JSON.stringify({ jobs: cloudflarePayload })
+        });
+
+        if (!cloudflareResponse.ok) {
+            const errorText = await cloudflareResponse.text();
+            throw new Error(`Falha ao agendar no Cloudflare: ${errorText}`);
+        }
+
+        const cloudflareResult = await cloudflareResponse.json();
+        console.log(`   ✓ ${cloudflareResult.created_count} jobs agendados no Cloudflare`);
+
+        // 8. Atualizar mensagens com scheduler_job_id
+        if (cloudflareResult.jobs && cloudflareResult.jobs.length > 0) {
+            console.log(`\n   🔄 Atualizando mensagens com scheduler_job_id...`);
+            
+            for (let i = 0; i < cloudflareResult.jobs.length; i++) {
+                const cloudflareJob = cloudflareResult.jobs[i];
+                const messageId = createdMessages[i].id;
+                
+                await base44.entities.Message.update(messageId, {
+                    scheduler_job_id: cloudflareJob.job_id
+                });
+            }
+            
+            console.log(`   ✓ Mensagens atualizadas com scheduler_job_id`);
+        }
+
+        return {
+            success: true,
+            messages_created: createdMessages.length,
+            jobs_scheduled: cloudflareResult.created_count
+        };
+
+    } catch (error) {
+        console.error('\n❌ Erro ao enviar para Cloudflare:', error);
+        return {
+            success: false,
+            error: error.message
+        };
+    }
+}

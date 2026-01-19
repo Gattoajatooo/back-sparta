@@ -1,0 +1,336 @@
+import { createClientFromRequest } from 'npm:@base44/sdk@0.7.1';
+
+// Função para limpar número de telefone
+function cleanPhoneNumber(phone) {
+    if (!phone || typeof phone !== 'string') {
+        return null;
+    }
+    return phone.replace(/\D/g, '');
+}
+
+// Função para formatar chat ID
+function formatChatId(phone) {
+    const cleanPhone = phone.replace(/\D/g, '');
+    if (cleanPhone.startsWith('55') && cleanPhone.length === 13) {
+        return `${cleanPhone}@c.us`;
+    }
+    if (cleanPhone.startsWith('55') && cleanPhone.length === 12) {
+        return `${cleanPhone}@c.us`;
+    }
+    if (!cleanPhone.startsWith('55')) {
+        if (cleanPhone.length === 11) {
+            return `55${cleanPhone}@c.us`;
+        } else if (cleanPhone.length === 10) {
+            return `55${cleanPhone}@c.us`;
+        }
+    }
+    return `${cleanPhone}@c.us`;
+}
+
+// Função para verificar se o número existe no WhatsApp
+async function checkNumberExists(apiUrl, apiKey, sessionName, phone) {
+    try {
+        const cleanBase = apiUrl.endsWith('/') ? apiUrl.slice(0, -1) : apiUrl;
+        const checkUrl = `${cleanBase}/api/contacts/check-exists?session=${sessionName}&phone=${phone}`;
+        
+        const response = await fetch(checkUrl, {
+            method: 'GET',
+            headers: {
+                'accept': 'application/json',
+                'Content-Type': 'application/json',
+                'X-Api-Key': apiKey
+            }
+        });
+        
+        if (!response.ok) {
+            console.error(`Check exists failed: ${response.status}`);
+            return { numberExists: false, error: 'API error' };
+        }
+        
+        return await response.json();
+    } catch (error) {
+        console.error('Error checking number:', error);
+        return { numberExists: false, error: error.message };
+    }
+}
+
+// Função para aplicar system_tag
+async function applySystemTag(base44, contactId, errorType) {
+    try {
+        console.log('[saveContact] Aplicando system_tag:', errorType, 'ao contato:', contactId);
+        
+        // Buscar a system_tag
+        const systemTags = await base44.asServiceRole.entities.SystemTag.filter({
+            trigger_event: errorType,
+            is_active: true
+        });
+
+        if (!systemTags || systemTags.length === 0) {
+            console.log('[saveContact] System tag não encontrada para:', errorType);
+            return { applied: false, error: 'System tag não encontrada' };
+        }
+
+        const systemTag = systemTags[0];
+        console.log('[saveContact] System tag encontrada:', systemTag.name);
+
+        // Buscar o contato
+        const contact = await base44.entities.Contact.get(contactId);
+        
+        if (!contact) {
+            console.error('[saveContact] Contato não encontrado:', contactId);
+            return { applied: false, error: 'Contato não encontrado' };
+        }
+
+        // Verificar se já tem a tag
+        const currentSystemTags = contact.tags_system || [];
+        
+        if (currentSystemTags.includes(systemTag.id)) {
+            console.log('[saveContact] Contato já possui esta system_tag');
+            return { applied: false, alreadyHas: true };
+        }
+
+        // Adicionar a tag
+        const updatedSystemTags = [...currentSystemTags, systemTag.id];
+        
+        await base44.entities.Contact.update(contactId, {
+            tags_system: updatedSystemTags,
+            numberExists: false,
+            checked: true
+        });
+
+        console.log('[saveContact] System tag aplicada com sucesso:', systemTag.name);
+        return { applied: true, tagName: systemTag.name, tagId: systemTag.id };
+
+    } catch (error) {
+        console.error('[saveContact] Erro ao aplicar system_tag:', error);
+        return { applied: false, error: error.message };
+    }
+}
+
+Deno.serve(async (req) => {
+    try {
+        const base44 = createClientFromRequest(req);
+        const user = await base44.auth.me();
+
+        if (!user) {
+            return Response.json({ 
+                success: false, 
+                error: 'Usuário não autenticado' 
+            }, { status: 401 });
+        }
+
+        const { contactData, editingContactId, company_id } = await req.json();
+
+        if (!company_id) {
+            return Response.json({ 
+                success: false, 
+                error: 'ID da empresa é obrigatório' 
+            }, { status: 400 });
+        }
+
+        if (!contactData.first_name?.trim()) {
+            return Response.json({ 
+                success: false, 
+                error: 'Nome é obrigatório' 
+            }, { status: 400 });
+        }
+
+        // Preparar dados do contato
+        const contactPayload = {
+            company_id: company_id,
+            first_name: contactData.first_name.trim(),
+            last_name: contactData.last_name?.trim() || "",
+            nickname: contactData.nickname?.trim() || "",
+            document_number: contactData.document_number || "",
+            document_type: contactData.document_type || "",
+            gender: contactData.gender || "",
+            responsible_name: contactData.responsible_name || "",
+            email: contactData.email || "",
+            emails: contactData.emails || [],
+            phone: contactData.phone || "",
+            phones: contactData.phones || [],
+            birth_date: contactData.birth_date || "",
+            company_name: contactData.company_name || "",
+            position: contactData.position || "",
+            custom_position: contactData.custom_position || "",
+            status: contactData.status || "lead",
+            source: contactData.source || "",
+            tags: contactData.tags || [],
+            notes: contactData.notes || [],
+            value: contactData.value || null,
+            avatar_url: contactData.avatar_url || "",
+            addresses: contactData.addresses || [],
+            social_profiles: contactData.social_profiles || {},
+            banking_data: contactData.banking_data || {}
+        };
+
+        let savedContact;
+        let action;
+
+        if (editingContactId) {
+            // Atualizar contato existente
+            savedContact = await base44.entities.Contact.update(editingContactId, contactPayload);
+            action = 'update';
+        } else {
+            // Criar novo contato
+            savedContact = await base44.entities.Contact.create(contactPayload);
+            action = 'create';
+        }
+
+        // NOVA FUNCIONALIDADE: Verificar se o número existe no WhatsApp
+        let numberCheckResult = null;
+        
+        if (savedContact.phone) {
+            try {
+                console.log('[saveContact] Iniciando verificação de número para contato:', savedContact.id);
+                
+                // Buscar sessões ativas
+                const sessions = await base44.entities.Session.filter({
+                    company_id: company_id,
+                    status: 'WORKING'
+                });
+
+                if (sessions && sessions.length > 0) {
+                    const session = sessions[0];
+                    console.log('[saveContact] Usando sessão:', session.session_name);
+
+                    const apiUrl = Deno.env.get('WAHA_API_URL');
+                    const apiKey = Deno.env.get('WAHA_API_KEY');
+
+                    if (apiUrl && apiKey) {
+                        const cleanPhone = cleanPhoneNumber(savedContact.phone);
+                        const chatId = formatChatId(cleanPhone);
+
+                        const checkResult = await checkNumberExists(
+                            apiUrl,
+                            apiKey,
+                            session.session_name,
+                            chatId
+                        );
+
+                        console.log('[saveContact] Resultado da verificação:', checkResult);
+
+                        if (checkResult.numberExists === false) {
+                            // Número não existe - aplicar system_tag
+                            console.log('[saveContact] Número não existe, aplicando system_tag...');
+                            
+                            const tagResult = await applySystemTag(
+                                base44,
+                                savedContact.id,
+                                'number_not_exists'
+                            );
+
+                            numberCheckResult = {
+                                checked: true,
+                                exists: false,
+                                tagApplied: tagResult.applied,
+                                tagName: tagResult.tagName
+                            };
+                        } else {
+                            // Número existe - atualizar contato
+                            console.log('[saveContact] Número existe no WhatsApp');
+                            
+                            // Remover system_tag de "WhatsApp Inexistente" se existir
+                            const contact = await base44.entities.Contact.get(savedContact.id);
+                            const currentSystemTags = contact.tags_system || [];
+                            
+                            // Buscar ID da tag "number_not_exists"
+                            const systemTagsToRemove = await base44.asServiceRole.entities.SystemTag.filter({
+                                trigger_event: 'number_not_exists',
+                                is_active: true
+                            });
+                            
+                            let updatedSystemTags = currentSystemTags;
+                            if (systemTagsToRemove && systemTagsToRemove.length > 0) {
+                                const tagIdToRemove = systemTagsToRemove[0].id;
+                                updatedSystemTags = currentSystemTags.filter(tagId => tagId !== tagIdToRemove);
+                                console.log('[saveContact] Removendo system_tag de WhatsApp Inexistente');
+                            }
+
+                            // Buscar foto do WhatsApp automaticamente
+                            let profilePictureUrl = savedContact.avatar_url;
+                            try {
+                                console.log('[saveContact] Buscando foto do WhatsApp...');
+                                const profileUrl = `${apiUrl}/api/contacts/profile-picture?session=${session.session_name}&contactId=${chatId}`;
+                                
+                                const profileResponse = await fetch(profileUrl, {
+                                    method: 'GET',
+                                    headers: {
+                                        'accept': 'application/json',
+                                        'X-Api-Key': apiKey
+                                    }
+                                });
+
+                                if (profileResponse.ok) {
+                                    const profileData = await profileResponse.json();
+                                    if (profileData.profilePictureURL) {
+                                        profilePictureUrl = profileData.profilePictureURL;
+                                        console.log('[saveContact] Foto do WhatsApp obtida:', profilePictureUrl);
+                                    }
+                                }
+                            } catch (photoError) {
+                                console.error('[saveContact] Erro ao buscar foto do WhatsApp:', photoError);
+                            }
+                            
+                            await base44.entities.Contact.update(savedContact.id, {
+                                numberExists: true,
+                                checked: true,
+                                tags_system: updatedSystemTags,
+                                avatar_url: profilePictureUrl
+                            });
+
+                            numberCheckResult = {
+                                checked: true,
+                                exists: true,
+                                photoUpdated: profilePictureUrl !== savedContact.avatar_url
+                            };
+                        }
+                    } else {
+                        console.log('[saveContact] Credenciais WAHA não configuradas');
+                    }
+                } else {
+                    console.log('[saveContact] Nenhuma sessão ativa encontrada');
+                }
+            } catch (checkError) {
+                console.error('[saveContact] Erro ao verificar número:', checkError);
+                // Não falhar a operação se a verificação falhar
+            }
+        }
+
+        const response = {
+            success: true,
+            message: editingContactId ? 'Contato atualizado com sucesso!' : 'Contato criado com sucesso!',
+            contact: savedContact,
+            action: action
+        };
+
+        // Adicionar informações de verificação se disponível
+        if (numberCheckResult) {
+            response.numberCheck = numberCheckResult;
+        }
+
+        return Response.json(response);
+
+    } catch (error) {
+        console.error('Erro na função saveContact:', error);
+        
+        // Tratar diferentes tipos de erro
+        let errorMessage = 'Erro interno do servidor';
+        
+        if (error.message.includes('duplicate') || error.message.includes('unique')) {
+            errorMessage = 'Este contato já existe no sistema';
+        } else if (error.message.includes('validation')) {
+            errorMessage = 'Dados do contato são inválidos';
+        } else if (error.message) {
+            errorMessage = error.message;
+        }
+
+        return Response.json({
+            success: false,
+            error: errorMessage,
+            details: error.message
+        }, { 
+            status: 500 
+        });
+    }
+});
